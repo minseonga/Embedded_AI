@@ -437,6 +437,7 @@ class HandTrackingPipeline:
         landmark_weights=None,
         model_tag=None,
         build_only=False,
+        prune_mode='magnitude',
     ):
         self.base_path = str(MPT_DIR)
         self.model_dir = MODEL_DIR
@@ -448,9 +449,12 @@ class HandTrackingPipeline:
             precision = 'int8'
         if precision not in ('fp32', 'fp16', 'int8'):
             raise ValueError("precision must be one of: fp32, fp16, int8")
+        if prune_mode not in ('magnitude', 'channel_l1'):
+            raise ValueError("prune_mode must be one of: magnitude, channel_l1")
 
         self.precision = precision
         self.prune_ratio = prune_ratio
+        self.prune_mode = prune_mode
         self.providers = providers or _select_providers()
         self.model_tag = model_tag
         self.detector_weights = detector_weights or str(Path(self.base_path) / 'blazepalm.pth')
@@ -520,9 +524,9 @@ class HandTrackingPipeline:
 
         # Apply pruning if requested
         if self.prune_ratio > 0:
-            print(f"Applying {self.prune_ratio*100:.0f}% weight pruning...")
-            self._apply_weight_pruning(detector, self.prune_ratio)
-            self._apply_weight_pruning(landmark, self.prune_ratio)
+            print(f"Applying {self.prune_ratio*100:.0f}% pruning (mode={self.prune_mode})...")
+            self._apply_weight_pruning(detector, self.prune_ratio, mode=self.prune_mode)
+            self._apply_weight_pruning(landmark, self.prune_ratio, mode=self.prune_mode)
 
         # Export to ONNX
         base_det = det_path.replace('_int8', '').replace('_fp16', '') if self.precision != 'fp32' else det_path
@@ -553,14 +557,26 @@ class HandTrackingPipeline:
 
         print("Models ready!")
 
-    def _apply_weight_pruning(self, model, ratio):
-        """Zero out smallest weights per layer."""
+    def _apply_weight_pruning(self, model, ratio, mode='magnitude'):
+        """Zero out weights based on pruning mode."""
         for module in model.modules():
             if isinstance(module, nn.Conv2d):
                 w = module.weight.data
-                threshold = torch.quantile(w.abs().flatten(), ratio)
-                mask = w.abs() >= threshold
-                module.weight.data = w * mask.float()
+                if mode == 'channel_l1':
+                    # Structured: prune entire output channels by importance
+                    n_out = w.shape[0]
+                    n_keep = max(1, int(n_out * (1 - ratio)))
+                    importance = w.abs().sum(dim=(1, 2, 3))
+                    keep_idx = torch.topk(importance, n_keep).indices
+                    mask = torch.zeros_like(importance, dtype=torch.bool)
+                    mask[keep_idx] = True
+                    channel_mask = mask[:, None, None, None]
+                    module.weight.data = w * channel_mask
+                else:
+                    # Unstructured magnitude pruning
+                    threshold = torch.quantile(w.abs().flatten(), ratio)
+                    mask = w.abs() >= threshold
+                    module.weight.data = w * mask.float()
 
     def _convert_to_fp16(self, src_path, dst_path):
         """Convert an ONNX model to FP16 while keeping IO types in FP32."""

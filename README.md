@@ -38,7 +38,7 @@ If you have your own `.pth` weights:
 python tools/export_models.py \
   --detector-weights /path/to/blazepalm.pth \
   --landmark-weights /path/to/blazehand_landmark.pth \
-  --precision fp16 --prune 0.3 --tag myrun
+  --precision fp16 --prune 0.3 --prune-mode channel_l1 --tag myrun
 # ONNX saved to assets/models/palm_detector_fp16_pruned30_myrun.onnx, hand_landmark_fp16_pruned30_myrun.onnx
 ```
 Then run the app/viewer with the same `--precision/--prune`/`--tag` to pick up those files.

@@ -31,6 +31,7 @@ import numpy as np
 import queue
 import sounddevice as sd
 import traceback
+import collections
 import types
 
 # Paths
@@ -169,14 +170,9 @@ def count_hands_up_wrist(hand_landmarks, frame_h, thresh):
     return count
 
 
-def draw_face_landmarks(frame, face_landmarks, color=(0, 255, 255)):
-    """Draw a sparse subset of face landmarks to reduce clutter."""
-    h, w = frame.shape[:2]
-    idxs = [1, 33, 133, 263, 362, 13, 14, 61, 291]  # eyes corners + lip centers
-    for i in idxs:
-        lm = face_landmarks.landmark[i]
-        x, y = int(lm.x * w), int(lm.y * h)
-        cv2.circle(frame, (x, y), 2, color, -1)
+def draw_face_landmarks(frame, face_landmarks):
+    """No-op face overlay (disabled)."""
+    return
 
 
 def draw_mic_meter(frame, level, origin=(10, 140), size=(180, 12)):
@@ -204,6 +200,22 @@ def resolve_input_device(input_device, fallback_rate=16000):
         return dev, fallback_rate
 
 
+def draw_voice_wave(frame, samples, origin=(10, 160), size=(200, 50), color=(0, 200, 255)):
+    """Draw an oscilloscope-style waveform from mic levels."""
+    if not samples:
+        return
+    x0, y0 = origin
+    w, h = size
+    pts = []
+    n = len(samples)
+    for i, s in enumerate(samples):
+        x = x0 + int(w * i / max(1, n - 1))
+        y = y0 + h // 2 - int(s * h)
+        pts.append((x, y))
+    pts = np.array(pts, dtype=np.int32)
+    cv2.polylines(frame, [pts], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+
 class VoiceKeywordListener(threading.Thread):
     """Lightweight Vosk-based keyword listener (emoji/monkey). Optional."""
 
@@ -219,6 +231,7 @@ class VoiceKeywordListener(threading.Thread):
         self.level = 0.0
         self.error = None
         self.device_info = None
+        self.wave = collections.deque(maxlen=200)
 
     def stop(self):
         self._running = False
@@ -270,6 +283,7 @@ class VoiceKeywordListener(threading.Thread):
             arr = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
             rms = float(np.sqrt(np.mean(arr**2))) if arr.size else 0.0
             self.level = 0.8 * self.level + 0.2 * rms
+            self.wave.append(self.level)
             if rec.AcceptWaveform(bytes(indata)):
                 res = rec.Result()
                 if "text" in res:
@@ -308,6 +322,7 @@ class HFKeywordListener(threading.Thread):
         self.error = None
         self.level = 0.0
         self.device_info = None
+        self.wave = collections.deque(maxlen=200)
 
     def stop(self):
         self._running = False
@@ -402,6 +417,7 @@ class HFKeywordListener(threading.Thread):
             arr = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
             rms = float(np.sqrt(np.mean(arr**2))) if arr.size else 0.0
             self.level = 0.8 * self.level + 0.2 * rms
+            self.wave.append(self.level)
             self._buffer.extend(bytes(indata))
 
         try:
@@ -702,9 +718,11 @@ def main():
             if time.time() - last_voice_ts > 3 and voice_ready_notified:
                 voice_status = f"Voice[{voice_backend}]: ready"
             voice_level = getattr(listener, "level", 0.0) if listener else 0.0
+            voice_wave = list(getattr(listener, "wave", []))
             cv2.putText(vis, voice_status, (10, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 220, 255), 2)
             draw_mic_meter(vis, voice_level, origin=(10, 140), size=(180, 12))
+            draw_voice_wave(vis, voice_wave, origin=(10, 170), size=(220, 50), color=(0, 255, 180))
         cv2.putText(vis, 'Press "q" or ESC to quit', (10, h - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
