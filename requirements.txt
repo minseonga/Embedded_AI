@@ -1,0 +1,12 @@
+opencv-python
+mediapipe
+numpy
+torch
+onnx
+onnxruntime
+onnxconverter-common
+sounddevice
+vosk
+transformers
+soundfile
+safetensors
