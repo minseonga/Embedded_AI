@@ -27,19 +27,28 @@ class MediaPipeFaceDetector:
     def __init__(self, device: torch.device, precision: str = "fp16"):
         self.device = device
         self.precision = precision
+        self.frame_count = 0
+        self.detection_count = 0
 
         try:
             import mediapipe as mp
             self.mp_face_detection = mp.solutions.face_detection
 
-            # model_selection: 0 for short-range (faster), 1 for full-range
+            # model_selection: 0 for short-range (2m), 1 for full-range (5m)
+            # Using model 1 for better detection range
             self.face_detection = self.mp_face_detection.FaceDetection(
-                model_selection=0,  # Short-range, faster
-                min_detection_confidence=0.5
+                model_selection=1,  # Full-range for better detection
+                min_detection_confidence=0.3  # Lower threshold for better sensitivity
             )
             print("[FaceLandmark] MediaPipe Face Detection loaded (TFLite, optimized)")
+            print("[FaceLandmark] Model: Full-range (5m), Confidence: 0.3")
         except ImportError:
             print("[FaceLandmark] MediaPipe not found, face detection disabled")
+            self.face_detection = None
+        except Exception as e:
+            print(f"[FaceLandmark] MediaPipe initialization error: {e}")
+            import traceback
+            traceback.print_exc()
             self.face_detection = None
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
@@ -47,36 +56,60 @@ class MediaPipeFaceDetector:
         if self.face_detection is None:
             return np.array([])
 
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_detection.process(frame_rgb)
+        self.frame_count += 1
 
-        if not results.detections:
+        try:
+            # Validate frame
+            if frame is None or frame.size == 0:
+                print(f"[FaceLandmark] Invalid frame at count {self.frame_count}")
+                return np.array([])
+
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Process with MediaPipe
+            results = self.face_detection.process(frame_rgb)
+
+            if not results.detections:
+                # Log every 100 frames if no detection
+                if self.frame_count % 100 == 0:
+                    print(f"[FaceLandmark] No face detected in {self.frame_count} frames (detected: {self.detection_count})")
+                return np.array([])
+
+            # Convert to [x, y, w, h, score] format
+            faces = []
+            h, w = frame.shape[:2]
+
+            for detection in results.detections:
+                bbox = detection.location_data.relative_bounding_box
+                score = detection.score[0]
+
+                # Convert normalized coordinates to pixels
+                x = int(bbox.xmin * w)
+                y = int(bbox.ymin * h)
+                width = int(bbox.width * w)
+                height = int(bbox.height * h)
+
+                # Ensure bbox is within frame
+                x = max(0, x)
+                y = max(0, y)
+                width = min(w - x, width)
+                height = min(h - y, height)
+
+                if width > 0 and height > 0:
+                    faces.append([x, y, width, height, float(score)])
+                    self.detection_count += 1
+                    # Log first few detections
+                    if self.detection_count <= 3:
+                        print(f"[FaceLandmark] Face detected! Box: ({x}, {y}, {width}, {height}), Score: {score:.2f}")
+
+            return np.array(faces) if faces else np.array([])
+
+        except Exception as e:
+            print(f"[FaceLandmark] Face detection error at frame {self.frame_count}: {e}")
+            import traceback
+            traceback.print_exc()
             return np.array([])
-
-        # Convert to [x, y, w, h, score] format
-        faces = []
-        h, w = frame.shape[:2]
-
-        for detection in results.detections:
-            bbox = detection.location_data.relative_bounding_box
-            score = detection.score[0]
-
-            # Convert normalized coordinates to pixels
-            x = int(bbox.xmin * w)
-            y = int(bbox.ymin * h)
-            width = int(bbox.width * w)
-            height = int(bbox.height * h)
-
-            # Ensure bbox is within frame
-            x = max(0, x)
-            y = max(0, y)
-            width = min(w - x, width)
-            height = min(h - y, height)
-
-            faces.append([x, y, width, height, float(score)])
-
-        return np.array(faces) if faces else np.array([])
 
 
 class RatioBasedMAR:
