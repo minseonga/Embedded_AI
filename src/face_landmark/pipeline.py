@@ -20,8 +20,14 @@ MODEL_DIR = ROOT / "assets" / "models"
 
 # Model URLs (lightweight models for embedded devices)
 MODEL_URLS = {
-    "face_detector": "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
-    "face_landmark_68": "https://github.com/atksh/onnx-facial-lmk-detector/raw/main/facial_lmk_detector.onnx",
+    # Ultra-Light-Fast face detector (works with any ONNX runtime)
+    "face_detector_onnx": [
+        "https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/raw/master/models/onnx/version-RFB-320.onnx",
+    ],
+    # Multiple fallback URLs for face landmark model
+    "face_landmark_68": [
+        "https://github.com/atksh/onnx-facial-lmk-detector/releases/download/v0.0.1/facial_lmk_detector.onnx",
+    ],
 }
 
 # 68-landmark mouth indices (for smile detection)
@@ -40,8 +46,8 @@ def _select_providers():
     return [p for p in preferred if p in available]
 
 
-def download_model(name: str, url: str) -> str:
-    """Download model if not exists."""
+def download_model(name: str, urls) -> str:
+    """Download model if not exists. Supports single URL or list of fallback URLs."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     filename = f"{name}.onnx"
     filepath = MODEL_DIR / filename
@@ -49,15 +55,23 @@ def download_model(name: str, url: str) -> str:
     if filepath.exists():
         return str(filepath)
 
-    print(f"[FaceLandmark] Downloading {name}...")
-    try:
-        urllib.request.urlretrieve(url, filepath)
-        print(f"[FaceLandmark] Downloaded to {filepath}")
-    except Exception as e:
-        print(f"[FaceLandmark] Download failed: {e}")
-        raise
+    # Handle both single URL and list of URLs
+    url_list = urls if isinstance(urls, list) else [urls]
 
-    return str(filepath)
+    print(f"[FaceLandmark] Downloading {name}...")
+    last_error = None
+    for url in url_list:
+        try:
+            print(f"[FaceLandmark] Trying: {url}")
+            urllib.request.urlretrieve(url, filepath)
+            print(f"[FaceLandmark] Downloaded to {filepath}")
+            return str(filepath)
+        except Exception as e:
+            last_error = e
+            print(f"[FaceLandmark] Failed: {e}")
+            continue
+
+    raise last_error or Exception(f"All download URLs failed for {name}")
 
 
 def convert_to_fp16(src_path: str, dst_path: str) -> str:
@@ -99,26 +113,61 @@ def get_model_path(base_name: str, precision: str) -> str:
     return str(MODEL_DIR / f"{base_name}.onnx")
 
 
-class YuNetFaceDetector:
-    """YuNet face detector (OpenCV Zoo, very fast)."""
+class ONNXFaceDetector:
+    """Ultra-Light-Fast face detector using ONNX Runtime."""
 
-    def __init__(self, model_path: str, input_size: Tuple[int, int] = (320, 320)):
-        self.input_size = input_size
-        self.detector = cv2.FaceDetectorYN.create(
-            model_path,
-            "",
-            input_size,
-            score_threshold=0.5,
-            nms_threshold=0.3,
-            top_k=5000
+    def __init__(self, model_path: str, providers: List[str] = None):
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.session = ort.InferenceSession(
+            model_path, sess_options,
+            providers=providers or _select_providers()
         )
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_shape = self.session.get_inputs()[0].shape
+        # Ultra-Light-Fast uses 320x240 or 640x480
+        self.input_size = (320, 240)
+        self.score_threshold = 0.7
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
-        """Detect faces. Returns array of [x, y, w, h, ...landmarks, score]."""
+        """Detect faces. Returns array of [x, y, w, h, score]."""
         h, w = frame.shape[:2]
-        self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(frame)
-        return faces if faces is not None else np.array([])
+
+        # Preprocess
+        img = cv2.resize(frame, self.input_size)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32)
+        img = (img - 127.0) / 128.0  # Normalize to [-1, 1]
+        img = img.transpose(2, 0, 1)[None]  # NCHW
+
+        # Inference
+        outputs = self.session.run(None, {self.input_name: img})
+        confidences = outputs[0][0]  # (num_anchors, 2)
+        boxes = outputs[1][0]  # (num_anchors, 4)
+
+        # Filter by confidence
+        scores = confidences[:, 1]  # Face confidence
+        mask = scores > self.score_threshold
+        if not mask.any():
+            return np.array([])
+
+        scores = scores[mask]
+        boxes = boxes[mask]
+
+        # Convert from [x1, y1, x2, y2] normalized to [x, y, w, h] in pixels
+        scale_x = w / self.input_size[0]
+        scale_y = h / self.input_size[1]
+
+        faces = []
+        for box, score in zip(boxes, scores):
+            x1 = int(box[0] * w)
+            y1 = int(box[1] * h)
+            x2 = int(box[2] * w)
+            y2 = int(box[3] * h)
+            faces.append([x1, y1, x2 - x1, y2 - y1, score])
+
+        return np.array(faces) if faces else np.array([])
 
 
 class ONNXFaceLandmark:
@@ -203,7 +252,6 @@ class FaceLandmarkPipeline:
         self,
         precision: str = 'fp16',
         providers: List[str] = None,
-        use_yunet: bool = True,
     ):
         self.precision = precision
         self.providers = providers or _select_providers()
@@ -212,16 +260,13 @@ class FaceLandmarkPipeline:
         print("[FaceLandmark] Initializing GPU-accelerated face landmark pipeline...")
         print(f"[FaceLandmark] Available providers: {self.providers}")
 
-        # Face detector (YuNet - very fast, uses OpenCV DNN which can use CUDA)
-        if use_yunet:
-            try:
-                det_path = download_model("face_detection_yunet", MODEL_URLS["face_detector"])
-                self.detector = YuNetFaceDetector(det_path)
-                print("[FaceLandmark] YuNet face detector loaded")
-            except Exception as e:
-                print(f"[FaceLandmark] YuNet load failed: {e}, using Haar cascade fallback")
-                self.detector = None
-        else:
+        # Face detector (ONNX-based Ultra-Light-Fast detector)
+        try:
+            det_path = download_model("face_detector_onnx", MODEL_URLS["face_detector_onnx"])
+            self.detector = ONNXFaceDetector(det_path, providers=self.providers)
+            print("[FaceLandmark] ONNX face detector loaded")
+        except Exception as e:
+            print(f"[FaceLandmark] ONNX face detector load failed: {e}, trying Haar cascade")
             self.detector = None
 
         # Haar cascade fallback
@@ -231,10 +276,17 @@ class FaceLandmarkPipeline:
                 "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",  # apt-get opencv4
                 "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",   # apt-get opencv3
                 "/usr/share/OpenCV/haarcascades/haarcascade_frontalface_default.xml",   # older versions
+                # Jetson Nano specific paths
+                "/usr/share/opencv4/lbpcascades/../haarcascades/haarcascade_frontalface_default.xml",
             ]
             # Try cv2.data first (pip install opencv-python)
             if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
                 cascade_paths.insert(0, cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+            # Also try to find via locate or common package paths
+            import glob
+            extra_paths = glob.glob("/usr/share/**/haarcascade_frontalface_default.xml", recursive=True)
+            cascade_paths.extend(extra_paths)
 
             cascade_path = None
             for path in cascade_paths:
@@ -244,10 +296,14 @@ class FaceLandmarkPipeline:
 
             if cascade_path:
                 self.haar_cascade = cv2.CascadeClassifier(cascade_path)
-                print(f"[FaceLandmark] Using Haar cascade: {cascade_path}")
+                if self.haar_cascade.empty():
+                    print(f"[FaceLandmark] Warning: Haar cascade loaded but empty: {cascade_path}")
+                    self.haar_cascade = None
+                else:
+                    print(f"[FaceLandmark] Using Haar cascade: {cascade_path}")
             else:
-                print("[FaceLandmark] Warning: No Haar cascade found, face detection may fail")
-                self.haar_cascade = cv2.CascadeClassifier()
+                print("[FaceLandmark] Warning: No Haar cascade found")
+                self.haar_cascade = None
         else:
             self.haar_cascade = None
 
@@ -378,7 +434,8 @@ class FaceLandmarkPipeline:
         """Print pipeline info."""
         print(f"[FaceLandmark] Providers: {self.providers}")
         print(f"[FaceLandmark] Precision: {self.precision}")
-        print(f"[FaceLandmark] Detector: {'YuNet' if self.detector else 'Haar Cascade'}")
+        det_type = "ONNX" if self.detector else ("Haar" if self.haar_cascade else "None")
+        print(f"[FaceLandmark] Detector: {det_type}")
         print(f"[FaceLandmark] Landmark: {'ONNX 68-point' if self.landmark_model else 'None'} ({self.lm_size:.2f}MB)")
 
 
