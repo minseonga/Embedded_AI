@@ -102,16 +102,18 @@ def benchmark_hand_tracking():
 
 
 def benchmark_face_detection():
-    """Benchmark face detection with YuNet."""
+    """Benchmark face detection with Haar Cascade and DNN."""
     print("\n" + "=" * 80)
     print("FACE DETECTION BENCHMARK")
     print("=" * 80)
 
     configs = [
-        {"name": "YuNet (OpenCV DNN + CUDA)", "precision": "fp16"},
+        {"name": "Haar Cascade (default)", "precision": "fp16", "use_dnn": False},
+        {"name": "DNN Caffe (optional)", "precision": "fp16", "use_dnn": True},
     ]
 
     dummy_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+    results = []
 
     for cfg in configs:
         print(f"\n{'─' * 80}")
@@ -119,7 +121,10 @@ def benchmark_face_detection():
         print(f"{'─' * 80}")
 
         try:
-            pipeline = FaceLandmarkPipeline(precision=cfg["precision"])
+            pipeline = FaceLandmarkPipeline(
+                precision=cfg["precision"],
+                use_dnn=cfg["use_dnn"]
+            )
 
             # Warmup
             print("Warming up (10 frames)...")
@@ -141,20 +146,36 @@ def benchmark_face_detection():
             p95_ms = np.percentile(times, 95)
             fps = 1000.0 / mean_ms
 
+            results.append({
+                "name": cfg["name"],
+                "mean_ms": mean_ms,
+                "p95_ms": p95_ms,
+                "fps": fps,
+            })
+
             print(f"\nResults:")
             print(f"  Mean:   {mean_ms:>7.2f} ms")
             print(f"  Std:    {std_ms:>7.2f} ms")
             print(f"  P95:    {p95_ms:>7.2f} ms")
             print(f"  FPS:    {fps:>7.1f}")
-            print(f"\n  Note: YuNet is extremely lightweight (~1MB)")
-            print(f"        Optimized for edge devices like Jetson Nano")
 
         except Exception as e:
             print(f"Error: {e}")
             import traceback
             traceback.print_exc()
 
-    print("=" * 80)
+    # Summary
+    if results:
+        print("\n" + "=" * 80)
+        print("FACE DETECTION SUMMARY")
+        print("=" * 80)
+        print(f"{'Configuration':<30} {'Mean':>10} {'P95':>10} {'FPS':>8}")
+        print("─" * 80)
+        for r in results:
+            print(f"{r['name']:<30} {r['mean_ms']:>9.2f}ms {r['p95_ms']:>9.2f}ms {r['fps']:>7.1f}")
+        print("=" * 80)
+        print("\n  Note: Haar Cascade is ultra-fast and works with ALL OpenCV versions")
+        print("        DNN is more accurate but requires newer OpenCV")
 
 
 def main():
@@ -169,11 +190,12 @@ def main():
     print("\n" + "=" * 80)
     print("RECOMMENDATIONS FOR JETSON NANO")
     print("=" * 80)
-    print("  1. Use FP16 precision (Jetson's native precision)")
-    print("  2. Enable quantization (INT8) for maximum speed")
-    print("  3. YuNet face detection is ~10x faster than MTCNN")
+    print("  1. Use Haar Cascade (default) - ultra-fast, works with all OpenCV")
+    print("  2. Use FP16 precision (Jetson's native precision)")
+    print("  3. Enable quantization (INT8) for maximum speed")
     print("  4. MediaPipe model_complexity=0 is optimized for embedded")
-    print("  5. Expected performance: 15-25 FPS on Jetson Nano")
+    print("  5. Use --use-dnn for more accurate face detection (slightly slower)")
+    print("  6. Expected performance: 20-30 FPS on Jetson Nano")
     print("=" * 80)
 
 
