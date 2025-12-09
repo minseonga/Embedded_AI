@@ -566,6 +566,9 @@ def main():
     else:
         print(f"Opening camera {args.camera} (V4L2)...")
         cap = cv2.VideoCapture(args.camera)
+        # Force 640x480 for performance on Jetson Nano (default might be 8MP)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not cap.isOpened():
         print("Cannot open camera")

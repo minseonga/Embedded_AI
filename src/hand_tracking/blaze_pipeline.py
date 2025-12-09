@@ -105,7 +105,9 @@ class BlazeHandTrackingPipeline:
         Returns: (landmarks_list, detections, scale, pad)
         """
         # 1. Preprocess for Detector
-        img1, img2, scale, pad = resize_pad(frame)
+        # BlazePalm expects RGB input
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img1, img2, scale, pad = resize_pad(frame_rgb)
         
         # Convert to tensor
         img1_tensor = torch.from_numpy(img1).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
@@ -155,7 +157,7 @@ class BlazeHandTrackingPipeline:
             xc, yc, s, theta = xc.item(), yc.item(), s.item(), theta.item()
             
             # Extract ROI image
-            roi_img, affine, _ = self.extract_roi(frame, xc, yc, theta, s, self.resolution)
+            roi_img, affine, _ = self.extract_roi(img1, xc, yc, theta, s, self.resolution)
             roi_tensor = torch.from_numpy(roi_img).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
             roi_tensor = roi_tensor.to(self.device)
             
@@ -177,9 +179,9 @@ class BlazeHandTrackingPipeline:
             landmarks = self.denormalize_landmarks(landmarks, affine)
             
             # Map from img1 (256x256) to Original Frame
-            # pixel_orig = (pixel_img1 - pad) * scale
-            landmarks[:, 0] = (landmarks[:, 0] - pad[1]) * scale
-            landmarks[:, 1] = (landmarks[:, 1] - pad[0]) * scale
+            # pixel_orig = pixel_img1 * scale - pad
+            landmarks[:, 0] = landmarks[:, 0] * scale - pad[1]
+            landmarks[:, 1] = landmarks[:, 1] * scale - pad[0]
             
             landmarks_list.append(landmarks)
             
@@ -197,63 +199,30 @@ class BlazeHandTrackingPipeline:
             # Format: y1, x1, y2, x2, score
             bbox = denorm_det[:4].cpu().numpy()
             score = denorm_det[-1].item()
-            final_detections.append([bbox[0], bbox[1], bbox[2], bbox[3], score])
+            
+            # Normalize to [0, 1] relative to original frame
+            h, w = frame.shape[:2]
+            norm_bbox = [
+                bbox[0] / h, bbox[1] / w,
+                bbox[2] / h, bbox[3] / w
+            ]
+            final_detections.append([norm_bbox[0], norm_bbox[1], norm_bbox[2], norm_bbox[3], score])
 
         return landmarks_list, np.array(final_detections), scale, pad
 
-    def extract_roi(self, frame, xc, yc, theta, scale, res):
-        """Extract square ROI from frame."""
-        # xc, yc, scale are normalized [0,1] relative to 128x128 input?
-        # No, detection2roi output depends on detector output.
-        # If detector output is [0,1], then xc, yc are [0,1].
-        # We need to map to original image coordinates for extraction.
+    def extract_roi(self, img1, xc, yc, theta, scale, res):
+        """Extract square ROI from img1 (256x256)."""
+        # img1 is already 256x256 padded.
         
-        # Actually, let's look at how we process the frame.
-        # We resized frame to 256x256 (img1) then 128x128 (img2).
-        # Detector ran on img2.
-        # So detections are relative to img2 (or normalized).
-        # We should extract ROI from the *original* frame or img1?
-        # Usually original frame for best quality.
+        xc_px = xc * 256
+        yc_px = yc * 256
+        width_px = scale * 256
         
-        # Map normalized xc, yc to original frame
-        h, w = frame.shape[:2]
+        # ...
         
-        # But wait, resize_pad logic:
-        # img1 is 256x256 with padding.
-        # scale is size0[1] / w1 (original / 256).
-        
-        # Let's assume xc, yc are normalized [0,1].
-        # We need to convert them to pixel coordinates in the original frame.
-        # But we added padding.
-        
-        # Let's use a simpler approach: extract from the padded 256x256 image (img1)
-        # and then we don't need to worry about padding removal yet.
-        # But img1 is small.
-        
-        # Correct approach:
-        # 1. Calculate affine transform from ROI (in normalized coords) to Output (256x256).
-        # 2. Apply to original frame.
-        
-        # This is complex to implement from scratch correctly in one go.
-        # I will use a simplified affine transform using cv2.
-        
-        # xc, yc are center in normalized coords [0,1] of the 128x128 image.
-        # We need to map this to original image pixels.
-        # Original image was scaled by `1/scale` and padded.
-        
-        # Let's use the `denormalize_detections` logic in reverse or similar.
-        # Or just use the `img1` (256x256) which is easier.
-        # But `img1` is low res.
-        
-        # Let's stick to the logic:
-        # 1. Get ROI center/size in pixels of `img1` (256x256).
-        #    xc_px = xc * 256
-        #    yc_px = yc * 256
-        #    scale_px = scale * 256
-        # 2. Construct affine matrix to map this ROI to 256x256 output.
-        # 3. Apply warpAffine on `img1`.
-        
-        img1, _, _, _ = resize_pad(frame) # Get the 256x256 padded image
+        # We don't need to call resize_pad again.
+        # img1, _, _, _ = resize_pad(frame) 
+
         
         xc_px = xc * 256
         yc_px = yc * 256

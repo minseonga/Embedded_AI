@@ -138,6 +138,10 @@ class PalmDetector(nn.Module):
 	    assert(self.anchors.ndimension() == 2)
 	    assert(self.anchors.shape[0] == 2944)
 	    assert(self.anchors.shape[1] == 4)
+	    
+	    # Move to same device as model
+	    device = next(self.parameters()).device
+	    self.anchors = self.anchors.to(device)
 
 	def _preprocess(self, x):
 	    """Converts the image pixels to the range [-1, 1]."""

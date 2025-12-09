@@ -24,15 +24,23 @@ def test_device(device_name):
     dummy_frame = np.zeros((256, 256, 3), dtype=np.uint8)
     
     try:
-        start = time.time()
         # Warmup
-        print(f"[{device_name.upper()}] Sending frame to device...")
-        landmarks, detections, scale, pad = pipeline.process_frame(dummy_frame)
-        torch.cuda.synchronize() if device_name == 'cuda' else None
-        elapsed = (time.time() - start) * 1000
+        print(f"[{device_name.upper()}] Warmup (1/3)...")
+        for _ in range(3):
+            pipeline.process_frame(dummy_frame)
+            if device_name == 'cuda': torch.cuda.synchronize()
         
-        print(f"[{device_name.upper()}] Inference finished in {elapsed:.2f} ms")
-        print(f"[{device_name.upper()}] Detections: {len(detections)}")
+        # Benchmark
+        print(f"[{device_name.upper()}] Benchmarking (50 runs)...")
+        start = time.time()
+        for _ in range(50):
+            pipeline.process_frame(dummy_frame)
+            if device_name == 'cuda': torch.cuda.synchronize()
+        total_time = time.time() - start
+        avg_ms = (total_time / 50) * 1000
+        fps = 50 / total_time
+        
+        print(f"[{device_name.upper()}] Average Inference: {avg_ms:.2f} ms ({fps:.2f} FPS)")
         print(f"[{device_name.upper()}] PASS")
     except Exception as e:
         print(f"[{device_name.upper()}] FAIL: {e}")
