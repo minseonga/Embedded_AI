@@ -226,8 +226,28 @@ class FaceLandmarkPipeline:
 
         # Haar cascade fallback
         if self.detector is None:
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            self.haar_cascade = cv2.CascadeClassifier(cascade_path)
+            # Handle both pip opencv and apt-get python3-opencv
+            cascade_paths = [
+                "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",  # apt-get opencv4
+                "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",   # apt-get opencv3
+                "/usr/share/OpenCV/haarcascades/haarcascade_frontalface_default.xml",   # older versions
+            ]
+            # Try cv2.data first (pip install opencv-python)
+            if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
+                cascade_paths.insert(0, cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+            cascade_path = None
+            for path in cascade_paths:
+                if os.path.exists(path):
+                    cascade_path = path
+                    break
+
+            if cascade_path:
+                self.haar_cascade = cv2.CascadeClassifier(cascade_path)
+                print(f"[FaceLandmark] Using Haar cascade: {cascade_path}")
+            else:
+                print("[FaceLandmark] Warning: No Haar cascade found, face detection may fail")
+                self.haar_cascade = cv2.CascadeClassifier()
         else:
             self.haar_cascade = None
 
