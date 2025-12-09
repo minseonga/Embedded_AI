@@ -23,13 +23,9 @@ for node in model.graph.node:
     if node.op_type == "Resize":
         print(f"  {node.name} ({node.op_type})")
         for attr in node.attribute:
-            if attr.name == "mode":
-                print(f"    mode: {attr.s.decode('utf-8')}")
-            elif attr.name == "coordinate_transformation_mode":
-                print(f"    coordinate_transformation_mode: {attr.s.decode('utf-8')}")
-            else:
-                print(f"    {attr.name}: {attr}")
+            print(f"    {attr.name}: {attr}")
     elif node.op_type in ("Conv", "ConvTranspose"):
+         # Keep checking kernel_shape for these
          pass
 
 # Check for kernel_shape in Conv/ConvTranspose/MaxPool/AvgPool

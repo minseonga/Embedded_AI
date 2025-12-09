@@ -2,10 +2,10 @@ opencv-python
 mediapipe
 numpy
 torch
-onnx
-onnx2pytorch
+facenet-pytorch
 sounddevice
 vosk
 transformers
 soundfile
 safetensors
+librosa
