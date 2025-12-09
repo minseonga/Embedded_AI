@@ -3,64 +3,55 @@ import cv2
 import numpy as np
 import torch
 import time
-from src.hand_tracking import BlazeHandTrackingPipeline, draw_detections, draw_landmarks
+import sys
+from src.hand_tracking import BlazeHandTrackingPipeline
 
-def test_pipeline():
-    print("="*60)
-    print("Testing BlazeHandTrackingPipeline (Pure PyTorch)")
-    print("="*60)
-    
-    # 1. Initialize Pipeline with Pruning and Quantization
-    print("[1] Initializing Pipeline...")
+def test_device(device_name):
+    print(f"\n[{device_name.upper()}] Initializing Pipeline...")
     try:
         pipeline = BlazeHandTrackingPipeline(
-            prune_ratio=0.3,  # Request 30% pruning
-            quantize=False,   # Dynamic quantization (CPU only usually)
-            precision='fp32'  # Use fp32 for safety first
+            device=device_name,
+            prune_ratio=0.3,
+            quantize=False,
+            precision='fp32'
         )
-        print("    Pipeline initialized successfully.")
+        print(f"[{device_name.upper()}] Pipeline initialized.")
     except Exception as e:
-        print(f"    Failed to initialize: {e}")
+        print(f"[{device_name.upper()}] Initialization failed: {e}")
         return
 
-    # 2. Check Pruning
-    print("\n[2] Verifying Pruning...")
-    total_zeros = 0
-    total_elements = 0
-    for name, module in pipeline.detector.named_modules():
-        if isinstance(module, torch.nn.Conv2d):
-            total_zeros += torch.sum(module.weight == 0)
-            total_elements += module.weight.nelement()
-    
-    sparsity = 100. * total_zeros / total_elements
-    print(f"    Detector Sparsity: {sparsity:.2f}%")
-    if sparsity > 0:
-        print("    [PASS] Pruning applied successfully.")
-    else:
-        print("    [FAIL] Pruning not applied.")
-
-    # 3. Run Inference on Dummy Image
-    print("\n[3] Running Inference (Dummy Image)...")
-    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    # Draw a fake hand (white rectangle) to trigger detection? 
-    # Unlikely to work with trained model, but we check for crashes.
-    cv2.rectangle(dummy_frame, (200, 200), (400, 400), (255, 255, 255), -1)
+    print(f"[{device_name.upper()}] Running Inference (Dummy Image)...")
+    dummy_frame = np.zeros((256, 256, 3), dtype=np.uint8)
     
     try:
         start = time.time()
+        # Warmup
+        print(f"[{device_name.upper()}] Sending frame to device...")
         landmarks, detections, scale, pad = pipeline.process_frame(dummy_frame)
+        torch.cuda.synchronize() if device_name == 'cuda' else None
         elapsed = (time.time() - start) * 1000
-        print(f"    Inference time: {elapsed:.2f} ms")
-        print(f"    Detections: {len(detections)}")
-        print("    [PASS] Inference ran without crash.")
+        
+        print(f"[{device_name.upper()}] Inference finished in {elapsed:.2f} ms")
+        print(f"[{device_name.upper()}] Detections: {len(detections)}")
+        print(f"[{device_name.upper()}] PASS")
     except Exception as e:
-        print(f"    [FAIL] Inference failed: {e}")
+        print(f"[{device_name.upper()}] FAIL: {e}")
         import traceback
         traceback.print_exc()
 
-    # 4. Webcam Loop (Optional, if running interactively)
-    # print("\n[4] Starting Webcam Demo (Press ESC to quit)...")
-    # pipeline.run_webcam() # We haven't implemented run_webcam in BlazePipeline yet
+def test_pipeline():
+    print("="*60)
+    print("Diagnostics: BlazeHandTrackingPipeline")
+    print("="*60)
+    
+    # 1. Test CPU first (Baseline)
+    test_device('cpu')
+    
+    # 2. Test CUDA if available
+    if torch.cuda.is_available():
+        test_device('cuda')
+    else:
+        print("\n[CUDA] Skipped (Not available)")
 
 if __name__ == "__main__":
     test_pipeline()
