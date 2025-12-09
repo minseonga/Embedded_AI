@@ -102,80 +102,52 @@ def benchmark_hand_tracking():
 
 
 def benchmark_face_detection():
-    """Benchmark face detection with Haar Cascade and DNN."""
+    """Benchmark face detection with MediaPipe."""
     print("\n" + "=" * 80)
     print("FACE DETECTION BENCHMARK")
     print("=" * 80)
 
-    configs = [
-        {"name": "Haar Cascade (default)", "precision": "fp16", "use_dnn": False},
-        {"name": "DNN Caffe (optional)", "precision": "fp16", "use_dnn": True},
-    ]
-
     dummy_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    results = []
 
-    for cfg in configs:
-        print(f"\n{'─' * 80}")
-        print(f"Configuration: {cfg['name']}")
-        print(f"{'─' * 80}")
+    print(f"\n{'─' * 80}")
+    print(f"Configuration: MediaPipe Face Detection (TFLite)")
+    print(f"{'─' * 80}")
 
-        try:
-            pipeline = FaceLandmarkPipeline(
-                precision=cfg["precision"],
-                use_dnn=cfg["use_dnn"]
-            )
+    try:
+        pipeline = FaceLandmarkPipeline(precision="fp16")
 
-            # Warmup
-            print("Warming up (10 frames)...")
-            for _ in range(10):
-                pipeline.process_frame(dummy_frame)
+        # Warmup
+        print("Warming up (10 frames)...")
+        for _ in range(10):
+            pipeline.process_frame(dummy_frame)
 
-            # Benchmark
-            print("Running benchmark (100 frames)...")
-            times = []
-            for _ in range(100):
-                start = time.perf_counter()
-                landmarks, mar, face_box = pipeline.process_frame(dummy_frame)
-                elapsed = time.perf_counter() - start
-                times.append(elapsed * 1000)
+        # Benchmark
+        print("Running benchmark (100 frames)...")
+        times = []
+        for _ in range(100):
+            start = time.perf_counter()
+            landmarks, mar, face_box = pipeline.process_frame(dummy_frame)
+            elapsed = time.perf_counter() - start
+            times.append(elapsed * 1000)
 
-            times = np.array(times)
-            mean_ms = np.mean(times)
-            std_ms = np.std(times)
-            p95_ms = np.percentile(times, 95)
-            fps = 1000.0 / mean_ms
+        times = np.array(times)
+        mean_ms = np.mean(times)
+        std_ms = np.std(times)
+        p95_ms = np.percentile(times, 95)
+        fps = 1000.0 / mean_ms
 
-            results.append({
-                "name": cfg["name"],
-                "mean_ms": mean_ms,
-                "p95_ms": p95_ms,
-                "fps": fps,
-            })
+        print(f"\nResults:")
+        print(f"  Mean:   {mean_ms:>7.2f} ms")
+        print(f"  Std:    {std_ms:>7.2f} ms")
+        print(f"  P95:    {p95_ms:>7.2f} ms")
+        print(f"  FPS:    {fps:>7.1f}")
+        print(f"\n  Note: MediaPipe Face Detection works with ANY OpenCV version")
+        print(f"        Optimized TFLite models, no download needed")
 
-            print(f"\nResults:")
-            print(f"  Mean:   {mean_ms:>7.2f} ms")
-            print(f"  Std:    {std_ms:>7.2f} ms")
-            print(f"  P95:    {p95_ms:>7.2f} ms")
-            print(f"  FPS:    {fps:>7.1f}")
-
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # Summary
-    if results:
-        print("\n" + "=" * 80)
-        print("FACE DETECTION SUMMARY")
-        print("=" * 80)
-        print(f"{'Configuration':<30} {'Mean':>10} {'P95':>10} {'FPS':>8}")
-        print("─" * 80)
-        for r in results:
-            print(f"{r['name']:<30} {r['mean_ms']:>9.2f}ms {r['p95_ms']:>9.2f}ms {r['fps']:>7.1f}")
-        print("=" * 80)
-        print("\n  Note: Haar Cascade is ultra-fast and works with ALL OpenCV versions")
-        print("        DNN is more accurate but requires newer OpenCV")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def main():

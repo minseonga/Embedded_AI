@@ -1,9 +1,8 @@
 # face_landmark/pipeline.py
-# Ultra-lightweight face detector using Haar Cascades (apt-get opencv compatible).
-# Optimized for Jetson Nano - works with old OpenCV versions.
+# MediaPipe face detection (works with ANY OpenCV version).
+# Optimized for Jetson Nano - no OpenCV DNN/Haar dependencies.
 
 import os
-import urllib.request
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -14,154 +13,70 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "assets" / "models"
 
-# DNN model URLs (fallback option)
-CAFFE_PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-CAFFE_MODEL_URL = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
-
-def download_dnn_model():
-    """Download OpenCV DNN face detection model (Caffe)."""
-    prototxt_path = MODEL_DIR / "deploy.prototxt"
-    model_path = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
-
-    if prototxt_path.exists() and model_path.exists():
-        return str(prototxt_path), str(model_path)
-
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if not prototxt_path.exists():
-            print("[FaceLandmark] Downloading deploy.prototxt...")
-            urllib.request.urlretrieve(CAFFE_PROTOTXT_URL, str(prototxt_path))
-
-        if not model_path.exists():
-            print("[FaceLandmark] Downloading Caffe model (~10MB)...")
-            urllib.request.urlretrieve(CAFFE_MODEL_URL, str(model_path))
-
-        print(f"[FaceLandmark] DNN models downloaded")
-        return str(prototxt_path), str(model_path)
-    except Exception as e:
-        print(f"[FaceLandmark] DNN model download failed: {e}")
-        return None, None
-
-
-class HaarCascadeFaceDetector:
-    """Ultra-fast face detector using Haar Cascades.
+class MediaPipeFaceDetector:
+    """Face detector using MediaPipe (TFLite, works with any OpenCV version).
 
     Advantages:
-    - Works with ALL OpenCV versions (even old apt-get versions)
-    - Extremely fast (~1-2ms per frame on Jetson Nano)
-    - Very lightweight (~1MB)
-    - No download needed (built into OpenCV)
+    - Works with ALL OpenCV versions (no cv2.data or cv2.dnn dependency)
+    - Very fast and accurate
+    - No model download needed (included in MediaPipe)
+    - Optimized for embedded devices
     """
 
     def __init__(self, device: torch.device, precision: str = "fp16"):
         self.device = device
         self.precision = precision
-        self.scale_factor = 1.1
-        self.min_neighbors = 5
-        self.min_size = (30, 30)
 
-        # Load Haar Cascade (built into OpenCV)
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        self.detector = cv2.CascadeClassifier(cascade_path)
+        try:
+            import mediapipe as mp
+            self.mp_face_detection = mp.solutions.face_detection
 
-        if self.detector.empty():
-            raise RuntimeError("Failed to load Haar Cascade")
-
-        print(f"[FaceLandmark] Haar Cascade detector loaded (ultra-fast, built-in)")
+            # model_selection: 0 for short-range (faster), 1 for full-range
+            self.face_detection = self.mp_face_detection.FaceDetection(
+                model_selection=0,  # Short-range, faster
+                min_detection_confidence=0.5
+            )
+            print("[FaceLandmark] MediaPipe Face Detection loaded (TFLite, optimized)")
+        except ImportError:
+            print("[FaceLandmark] MediaPipe not found, face detection disabled")
+            self.face_detection = None
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
         """Return array of [x, y, w, h, score]."""
-        # Convert to grayscale for faster processing
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self.face_detection is None:
+            return np.array([])
 
-        # Detect faces
-        faces = self.detector.detectMultiScale(
-            gray,
-            scaleFactor=self.scale_factor,
-            minNeighbors=self.min_neighbors,
-            minSize=self.min_size,
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_detection.process(frame_rgb)
 
-        if len(faces) == 0:
+        if not results.detections:
             return np.array([])
 
         # Convert to [x, y, w, h, score] format
-        # Haar doesn't provide confidence, so we use 1.0
-        results = []
-        for (x, y, w, h) in faces:
-            results.append([int(x), int(y), int(w), int(h), 1.0])
-
-        return np.array(results) if results else np.array([])
-
-
-class DNNFaceDetector:
-    """DNN-based face detector using OpenCV DNN + Caffe.
-
-    Advantages:
-    - Works with OpenCV 3.3+ (most apt-get versions)
-    - More accurate than Haar Cascades
-    - CUDA acceleration support
-    - Still lightweight (~10MB)
-    """
-
-    def __init__(self, device: torch.device, precision: str = "fp16"):
-        self.device = device
-        self.precision = precision
-        self.confidence_threshold = 0.5
-
-        # Download models
-        prototxt_path, model_path = download_dnn_model()
-        if prototxt_path is None or model_path is None:
-            raise RuntimeError("Failed to download DNN models")
-
-        # Load DNN model
-        self.detector = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
-
-        # Set CUDA backend if available
-        if device.type == 'cuda':
-            try:
-                self.detector.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                self.detector.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                print("[FaceLandmark] DNN using CUDA backend")
-            except Exception:
-                print("[FaceLandmark] DNN using CPU backend")
-        else:
-            print("[FaceLandmark] DNN using CPU backend")
-
-        print(f"[FaceLandmark] DNN detector loaded (~10MB, CUDA accelerated)")
-
-    def detect(self, frame: np.ndarray) -> np.ndarray:
-        """Return array of [x, y, w, h, score]."""
+        faces = []
         h, w = frame.shape[:2]
 
-        # Prepare blob
-        blob = cv2.dnn.blobFromImage(
-            frame, 1.0, (300, 300), (104.0, 177.0, 123.0), False, False
-        )
+        for detection in results.detections:
+            bbox = detection.location_data.relative_bounding_box
+            score = detection.score[0]
 
-        # Forward pass
-        self.detector.setInput(blob)
-        detections = self.detector.forward()
+            # Convert normalized coordinates to pixels
+            x = int(bbox.xmin * w)
+            y = int(bbox.ymin * h)
+            width = int(bbox.width * w)
+            height = int(bbox.height * h)
 
-        # Parse detections
-        results = []
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
+            # Ensure bbox is within frame
+            x = max(0, x)
+            y = max(0, y)
+            width = min(w - x, width)
+            height = min(h - y, height)
 
-            if confidence > self.confidence_threshold:
-                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                (x1, y1, x2, y2) = box.astype(int)
+            faces.append([x, y, width, height, float(score)])
 
-                x, y = max(0, x1), max(0, y1)
-                w_box = min(w - x, x2 - x1)
-                h_box = min(h - y, y2 - y1)
-
-                results.append([int(x), int(y), int(w_box), int(h_box), float(confidence)])
-
-        return np.array(results) if results else np.array([])
+        return np.array(faces) if faces else np.array([])
 
 
 class RatioBasedMAR:
@@ -203,16 +118,17 @@ class RatioBasedMAR:
 class FaceLandmarkPipeline:
     """Face detection pipeline for Jetson Nano + MAR estimation.
 
-    Uses Haar Cascades by default (works with all OpenCV versions).
-    Falls back to DNN if Haar fails.
+    Uses MediaPipe Face Detection (works with ANY OpenCV version).
     """
 
     def __init__(
         self,
         precision: str = "fp16",
         use_cuda: bool = True,
-        use_dnn: bool = False,  # Set to True to prefer DNN over Haar
+        use_dnn: bool = False,  # Ignored, kept for compatibility
     ):
+        del use_dnn  # Ignored parameter
+
         self.precision = precision
         self.device = torch.device('cuda' if use_cuda and torch.cuda.is_available() else 'cpu')
 
@@ -220,40 +136,12 @@ class FaceLandmarkPipeline:
         print(f"[FaceLandmark] Device: {self.device}")
 
         self.detector = None
-        detector_type = "unknown"
-
-        # Try to load face detector
-        if use_dnn:
-            # Try DNN first if requested
-            try:
-                self.detector = DNNFaceDetector(self.device, precision=self.precision)
-                detector_type = "DNN (OpenCV Caffe)"
-            except Exception as e:
-                print(f"[FaceLandmark] DNN detector failed: {e}, falling back to Haar Cascade")
-                try:
-                    self.detector = HaarCascadeFaceDetector(self.device, precision=self.precision)
-                    detector_type = "Haar Cascade (built-in)"
-                except Exception as e2:
-                    print(f"[FaceLandmark] Haar Cascade failed: {e2}")
-                    self.detector = None
-        else:
-            # Try Haar Cascade first (default, works with all OpenCV)
-            try:
-                self.detector = HaarCascadeFaceDetector(self.device, precision=self.precision)
-                detector_type = "Haar Cascade (built-in)"
-            except Exception as e:
-                print(f"[FaceLandmark] Haar Cascade failed: {e}, falling back to DNN")
-                try:
-                    self.detector = DNNFaceDetector(self.device, precision=self.precision)
-                    detector_type = "DNN (OpenCV Caffe)"
-                except Exception as e2:
-                    print(f"[FaceLandmark] DNN detector failed: {e2}")
-                    self.detector = None
-
-        if self.detector:
-            print(f"[FaceLandmark] Using {detector_type}")
-        else:
-            print("[FaceLandmark] WARNING: No face detector available!")
+        try:
+            self.detector = MediaPipeFaceDetector(self.device, precision=self.precision)
+            print("[FaceLandmark] MediaPipe Face Detection ready")
+        except Exception as e:
+            print(f"[FaceLandmark] Face detector failed: {e}")
+            self.detector = None
 
         self.mar_estimator = RatioBasedMAR()
 
@@ -287,20 +175,10 @@ class FaceLandmarkPipeline:
     def print_stats(self):
         print(f"[FaceLandmark] Device: {self.device}")
         print(f"[FaceLandmark] Precision: {self.precision}")
-
-        if self.detector:
-            if isinstance(self.detector, HaarCascadeFaceDetector):
-                det_type = "Haar Cascade (built-in, ultra-fast)"
-            elif isinstance(self.detector, DNNFaceDetector):
-                det_type = "DNN Caffe (~10MB, CUDA accelerated)"
-            else:
-                det_type = "Unknown"
-        else:
-            det_type = "None"
-
+        det_type = "MediaPipe Face Detection (TFLite)" if self.detector else "None"
         print(f"[FaceLandmark] Detector: {det_type}")
         print(f"[FaceLandmark] MAR: Ratio-based estimation")
-        print(f"[FaceLandmark] Compatible with apt-get OpenCV")
+        print(f"[FaceLandmark] Works with ANY OpenCV version")
 
 
 def draw_face_box(frame: np.ndarray, face_box: np.ndarray, color=(255, 0, 0)):
