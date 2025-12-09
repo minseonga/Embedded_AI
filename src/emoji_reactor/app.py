@@ -285,9 +285,9 @@ class VoiceKeywordListener(threading.Thread):
 
 
 class HFKeywordListener(threading.Thread):
-    """Keyword listener using Hugging Face ASR models."""
+    """Keyword listener using Hugging Face ASR models with quantization/pruning support."""
 
-    def __init__(self, model_id, keywords=("emoji", "monkey"), sample_rate=16000, chunk_seconds=4, device="cpu", base_repo="openai/whisper-tiny", input_device=None):
+    def __init__(self, model_id, keywords=("emoji", "monkey"), sample_rate=16000, chunk_seconds=4, device="cpu", base_repo="openai/whisper-tiny", input_device=None, quantize=False, prune_ratio=0.0):
         super().__init__(daemon=True)
         self.model_id = model_id
         self.keywords = keywords
@@ -296,6 +296,8 @@ class HFKeywordListener(threading.Thread):
         self.device = device
         self.base_repo = base_repo
         self.input_device = input_device
+        self.quantize = quantize
+        self.prune_ratio = prune_ratio
         self._last = None
         self._running = True
         self._ready = threading.Event()
@@ -380,6 +382,33 @@ class HFKeywordListener(threading.Thread):
             if self.device != "cpu":
                 model = model.to(self.device)
             model.eval()
+
+            # Apply pruning if requested
+            if self.prune_ratio > 0:
+                print(f"[VOICE] Applying {self.prune_ratio * 100:.1f}% magnitude pruning to Whisper model...")
+                try:
+                    import torch.nn.utils.prune as prune
+                    for name, module in model.named_modules():
+                        if isinstance(module, torch.nn.Linear):
+                            prune.l1_unstructured(module, name='weight', amount=self.prune_ratio)
+                            prune.remove(module, 'weight')
+                    print(f"[VOICE] Pruning applied successfully")
+                except Exception as e:
+                    print(f"[VOICE] Warning: Pruning failed: {e}")
+
+            # Apply quantization if requested
+            if self.quantize:
+                print(f"[VOICE] Applying INT8 dynamic quantization to Whisper model...")
+                try:
+                    model = torch.quantization.quantize_dynamic(
+                        model,
+                        {torch.nn.Linear},
+                        dtype=torch.qint8
+                    )
+                    print(f"[VOICE] Quantization applied successfully")
+                except Exception as e:
+                    print(f"[VOICE] Warning: Quantization failed: {e}")
+
         except Exception as e:
             self.error = f"Failed to load HF model {model_id}: {e}"
             print(f"[VOICE] Failed to load HF model {model_id}: {e}")
@@ -387,7 +416,9 @@ class HFKeywordListener(threading.Thread):
             return
 
         self._ready.set()
-        print(f"[VOICE] HF ASR ready: {model_id} (hotwords: {', '.join(self.keywords)})")
+        quant_msg = " [INT8]" if self.quantize else ""
+        prune_msg = f" [{self.prune_ratio*100:.0f}% pruned]" if self.prune_ratio > 0 else ""
+        print(f"[VOICE] HF ASR ready: {model_id}{quant_msg}{prune_msg} (hotwords: {', '.join(self.keywords)})")
 
         dev_idx, sr = resolve_input_device(self.input_device, self.sample_rate)
         try:
@@ -533,6 +564,10 @@ def main():
                         help='Base repo to load config/tokenizer when using local weights.')
     parser.add_argument('--hf-device', type=str, default="cpu", help='Device for HF ASR (cpu or cuda).')
     parser.add_argument('--hf-chunk', type=int, default=4, help='Seconds per ASR chunk for HF backend.')
+    parser.add_argument('--voice-quantize', action='store_true',
+                        help='Apply INT8 quantization to ASR model (faster inference).')
+    parser.add_argument('--voice-prune', type=float, default=0.0, metavar='RATIO',
+                        help='Apply magnitude pruning to ASR model (0.0-1.0, e.g., 0.3 for 30%% sparsity).')
     parser.add_argument('--no-face', action='store_true', help='Disable drawing face landmarks.')
     parser.add_argument('--no-music', action='store_true', help='Disable background music.')
     parser.add_argument('--input-device', type=str, default=None,
@@ -625,7 +660,9 @@ def main():
                 chunk_seconds=args.hf_chunk,
                 device=args.hf_device,
                 base_repo=args.hf_asr_base,
-                input_device=args.input_device
+                input_device=args.input_device,
+                quantize=args.voice_quantize,
+                prune_ratio=args.voice_prune
             )
         elif backend == 'vosk':
             listener = VoiceKeywordListener(model_path=args.vosk_model, input_device=args.input_device)

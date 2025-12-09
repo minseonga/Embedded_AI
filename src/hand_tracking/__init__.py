@@ -1,4 +1,8 @@
-from .pipeline import HandTrackingPipeline, draw_detections, draw_landmarks
-from .blaze_pipeline import BlazeHandTrackingPipeline
+from .pipeline import (
+    HandTrackingPipeline,
+    BlazeHandTrackingPipeline,
+    draw_detections,
+    draw_landmarks
+)
 
 __all__ = ["HandTrackingPipeline", "BlazeHandTrackingPipeline", "draw_detections", "draw_landmarks"]
