@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import onnx
+from onnx import helper as onnx_helper
 import torch
 from onnx2pytorch import ConvertModel
 
@@ -95,7 +96,20 @@ class TorchOnnxWrapper:
 
     def __init__(self, onnx_path: str, device: torch.device, precision: str = "fp16"):
         model = onnx.load(onnx_path)
-        self.model = ConvertModel(model, experimental=True)
+        model = self._patch_conv_kernel_size(model)
+
+        self.model = None
+        last_err = None
+        for exp_flag in (True, False):
+            try:
+                self.model = ConvertModel(model, experimental=exp_flag)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        if self.model is None:
+            raise RuntimeError(f"Failed to convert ONNX to PyTorch: {last_err}") from last_err
+
         self.model.eval()
         if precision == "fp16":
             self.model.half()
@@ -106,6 +120,30 @@ class TorchOnnxWrapper:
     def __call__(self, x: torch.Tensor):
         with torch.no_grad():
             return self.model(x)
+
+    @staticmethod
+    def _patch_conv_kernel_size(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+        """Ensure Conv nodes expose kernel_size attr expected by onnx2pytorch."""
+        init_map = {init.name: init for init in onnx_model.graph.initializer}
+        for node in onnx_model.graph.node:
+            if node.op_type != "Conv":
+                continue
+            attr_names = {attr.name for attr in node.attribute}
+            if "kernel_size" in attr_names:
+                continue
+            kernel_shape_attr = next((a for a in node.attribute if a.name == "kernel_shape"), None)
+            kernel_shape = list(kernel_shape_attr.ints) if kernel_shape_attr is not None else None
+
+            if kernel_shape is None and len(node.input) > 1:
+                weight_name = node.input[1]
+                weight_init = init_map.get(weight_name)
+                if weight_init and len(weight_init.dims) >= 4:
+                    kernel_shape = [int(weight_init.dims[2]), int(weight_init.dims[3])]
+                    node.attribute.append(onnx_helper.make_attribute("kernel_shape", kernel_shape))
+
+            if kernel_shape is not None:
+                node.attribute.append(onnx_helper.make_attribute("kernel_size", kernel_shape))
+        return onnx_model
 
 
 class UltraFaceDetector:
