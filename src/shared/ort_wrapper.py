@@ -16,14 +16,25 @@ class OrtWrapper:
         
         # Configure providers
         providers = ['CPUExecutionProvider']
-        if device.type == 'cuda':
+        available_providers = ort.get_available_providers()
+        
+        # Prioritize CUDA (Jetson/Linux)
+        if 'CUDAExecutionProvider' in available_providers:
             providers.insert(0, 'CUDAExecutionProvider')
+        # Prioritize CoreML (Mac)
+        elif 'CoreMLExecutionProvider' in available_providers:
+            providers.insert(0, 'CoreMLExecutionProvider')
             
         self.session = ort.InferenceSession(str(onnx_path), sess_options, providers=providers)
         
-        # Check if CUDA was requested but not used
-        if device.type == 'cuda' and 'CUDAExecutionProvider' not in self.session.get_providers():
-            print(f"[OrtWrapper] WARN: CUDA requested but 'CUDAExecutionProvider' not available. Running on CPU.")
+        # Check if requested device matches available providers
+        used_providers = self.session.get_providers()
+        print(f"[OrtWrapper] Active providers: {used_providers}")
+        
+        if device.type == 'cuda' and 'CUDAExecutionProvider' not in used_providers:
+             print(f"[OrtWrapper] WARN: CUDA requested but 'CUDAExecutionProvider' not active. Available: {available_providers}")
+        elif device.type == 'mps' and 'CoreMLExecutionProvider' not in used_providers:
+             print(f"[OrtWrapper] WARN: MPS requested but 'CoreMLExecutionProvider' not active. Available: {available_providers}")
             
         self.input_name = self.session.get_inputs()[0].name
         self.input_type = self.session.get_inputs()[0].type  # e.g. 'tensor(float)'
