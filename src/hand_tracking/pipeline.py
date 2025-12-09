@@ -246,6 +246,7 @@ class TorchOnnxWrapper:
     def __init__(self, onnx_path: Union[str, Path], device: torch.device, precision: str = "fp16"):
         onnx_model = onnx.load(str(onnx_path))
         onnx_model = self._patch_conv_kernel_size(onnx_model)
+        onnx_model = self._remove_storage_order(onnx_model)
 
         # Some ONNX exports miss kernel_size attr; patch + retry with/without experimental flag.
         self.model = None
@@ -272,10 +273,10 @@ class TorchOnnxWrapper:
 
     @staticmethod
     def _patch_conv_kernel_size(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
-        """Ensure Conv nodes expose kernel_size attr expected by onnx2pytorch."""
+        """Ensure Conv/ConvTranspose nodes expose kernel_size attr expected by onnx2pytorch."""
         init_map = {init.name: init for init in onnx_model.graph.initializer}
         for node in onnx_model.graph.node:
-            if node.op_type != "Conv":
+            if node.op_type not in ("Conv", "ConvTranspose"):
                 continue
             attr_names = {attr.name for attr in node.attribute}
             if "kernel_size" in attr_names:
@@ -288,12 +289,24 @@ class TorchOnnxWrapper:
                 weight_name = node.input[1]
                 weight_init = init_map.get(weight_name)
                 if weight_init and len(weight_init.dims) >= 4:
-                    # weight dims: [out_channels, in_channels/groups, kh, kw]
+                    # weight dims: [out_channels, in_channels/groups, kh, kw] (Conv)
+                    # or [in_channels, out_channels/groups, kh, kw] (ConvTranspose)
                     kernel_shape = [int(weight_init.dims[2]), int(weight_init.dims[3])]
                     node.attribute.append(onnx_helper.make_attribute("kernel_shape", kernel_shape))
 
             if kernel_shape is not None:
-                node.attribute.append(onnx_helper.make_attribute("kernel_size", kernel_shape))
+                # node.attribute.append(onnx_helper.make_attribute("kernel_size", kernel_shape))
+                pass
+        return onnx_model
+
+    @staticmethod
+    def _remove_storage_order(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+        """Remove storage_order attribute from all nodes (not supported by onnx2pytorch)."""
+        for node in onnx_model.graph.node:
+            for i, attr in enumerate(node.attribute):
+                if attr.name == "storage_order":
+                    node.attribute.pop(i)
+                    break
         return onnx_model
 
 
@@ -460,8 +473,23 @@ class HandTrackingPipeline:
             self.detector = TorchPalmDetector(det_path, self.device, precision=self.precision)
             self.landmark = TorchHandLandmark(lm_path, self.device, precision=self.precision)
 
+            if self.prune_ratio > 0:
+                print(f"[HandTracking] Applying structured pruning (ratio={self.prune_ratio})...")
+                self._prune_model(self.detector.wrapper.model, self.prune_ratio)
+                self._prune_model(self.landmark.wrapper.model, self.prune_ratio)
+
         self.det_size = det_path.stat().st_size / (1024 * 1024)
         self.lm_size = lm_path.stat().st_size / (1024 * 1024)
+
+    def _prune_model(self, model: torch.nn.Module, ratio: float):
+        """Apply structured pruning (L1 norm) to Conv2d layers."""
+        import torch.nn.utils.prune as prune
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                # Prune filters (dim=0) based on L1 norm
+                prune.ln_structured(module, name="weight", amount=ratio, n=1, dim=0)
+                # Make pruning permanent (remove mask, modify weight directly)
+                prune.remove(module, "weight")
 
     def process_frame(self, frame: np.ndarray):
         """Process a single BGR frame. Returns (landmarks, detections, scale, pad)."""
