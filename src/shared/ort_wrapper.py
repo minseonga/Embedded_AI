@@ -20,11 +20,24 @@ class OrtWrapper:
             providers.insert(0, 'CUDAExecutionProvider')
             
         self.session = ort.InferenceSession(str(onnx_path), sess_options, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
         
+        # Check if CUDA was requested but not used
+        if device.type == 'cuda' and 'CUDAExecutionProvider' not in self.session.get_providers():
+            print(f"[OrtWrapper] WARN: CUDA requested but 'CUDAExecutionProvider' not available. Running on CPU.")
+            
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_type = self.session.get_inputs()[0].type  # e.g. 'tensor(float)'
+
     def __call__(self, x: torch.Tensor):
         # Convert PyTorch tensor to numpy
         x_np = x.detach().cpu().numpy()
+        
+        # Check expected input type and cast if necessary
+        # 'tensor(float)' corresponds to float32
+        if self.input_type == 'tensor(float)' and x_np.dtype != np.float32:
+            x_np = x_np.astype(np.float32)
+        elif self.input_type == 'tensor(float16)' and x_np.dtype != np.float16:
+            x_np = x_np.astype(np.float16)
         
         # Run inference
         outputs = self.session.run(None, {self.input_name: x_np})

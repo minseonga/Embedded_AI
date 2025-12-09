@@ -12,11 +12,21 @@ print(f"Inspecting {model_path}...")
 
 print("Inputs:")
 for inp in model.graph.input:
-    print(f"  {inp.name}: {inp.type.tensor_type.shape}")
+    print(f"  {inp.name}: {inp.type}")
 
-print("Outputs:")
+print("\nOutputs:")
 for out in model.graph.output:
-    print(f"  {out.name}: {out.type.tensor_type.shape}")
+    print(f"  {out.name}: {out.type}")
+
+print("\nNodes:")
+for node in model.graph.node:
+    if node.op_type == "Resize":
+        print(f"  {node.name} ({node.op_type})")
+        for attr in node.attribute:
+            print(f"    {attr.name}: {attr}")
+    elif node.op_type in ("Conv", "ConvTranspose"):
+         # Keep checking kernel_shape for these
+         pass
 
 # Check for kernel_shape in Conv/ConvTranspose/MaxPool/AvgPool
 print("\nChecking nodes for missing kernel_shape...")
