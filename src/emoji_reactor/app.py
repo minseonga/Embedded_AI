@@ -44,7 +44,7 @@ AUDIO_DIR = ASSETS / "audio"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from hand_tracking import HandTrackingPipeline, draw_landmarks, draw_detections  # noqa: E402
+from hand_tracking import HandTrackingPipeline, BlazeHandTrackingPipeline, draw_landmarks, draw_detections  # noqa: E402
 from face_landmark import FaceLandmarkPipeline  # noqa: E402
 
 WINDOW_WIDTH = 640
@@ -540,12 +540,10 @@ def main():
     parser.add_argument('--no-gstreamer', action='store_true', help='Disable GStreamer (use standard V4L2).')
     parser.add_argument('--use-dnn', action='store_true',
                         help='Use DNN face detector instead of Haar Cascade (more accurate, slightly slower).')
+    parser.add_argument("--use-pytorch", action="store_true", help="Use pure PyTorch pipeline (supports pruning/quantization)")
     args = parser.parse_args()
 
     emoji_sets = load_emojis()
-
-    pipeline = HandTrackingPipeline(prune_ratio=args.prune, precision=args.precision)
-    pipeline.print_stats()
 
     music_path = AUDIO_DIR / "yessir.mp3"
     music = None
@@ -580,6 +578,24 @@ def main():
     # Lightweight face detection (Haar Cascade or DNN)
     face_pipeline = FaceLandmarkPipeline(precision=args.precision, use_dnn=args.use_dnn)
     face_pipeline.print_stats()
+
+    # Initialize Hand Tracking
+    print(f"Initializing Hand Tracking (Precision: {args.precision}, Prune: {args.prune})...")
+    if args.use_pytorch:
+        print("[INFO] Using Pure PyTorch Pipeline (BlazeHandTrackingPipeline)")
+        pipeline = BlazeHandTrackingPipeline(
+            precision=args.precision,
+            prune_ratio=args.prune,
+            quantize=(args.precision == 'int8')
+        )
+    else:
+        print("[INFO] Using MediaPipe Pipeline (HandTrackingPipeline)")
+        pipeline = HandTrackingPipeline(
+            precision=args.precision,
+            prune_ratio=args.prune,
+            use_quantized=(args.precision == 'int8')
+        )
+    pipeline.print_stats()
 
     # Optional voice hotword listener
     listener = None

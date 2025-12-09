@@ -1,3 +1,3 @@
-from .pipeline import FaceLandmarkPipeline
+from .pipeline import FaceLandmarkPipeline, draw_face_box
 
-__all__ = ['FaceLandmarkPipeline']
+__all__ = ['FaceLandmarkPipeline', 'draw_face_box']
