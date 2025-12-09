@@ -537,6 +537,7 @@ def main():
     parser.add_argument('--no-music', action='store_true', help='Disable background music.')
     parser.add_argument('--input-device', type=str, default=None,
                         help='sounddevice input device name or index for mic (e.g., 0 or "MacBook Pro Microphone").')
+    parser.add_argument('--no-gstreamer', action='store_true', help='Disable GStreamer (use standard V4L2).')
     args = parser.parse_args()
 
     emoji_sets = load_emojis()
@@ -550,19 +551,22 @@ def main():
         music = BackgroundMusic(str(music_path), enabled=True)
         music.start()
 
-    GSTREAMER_PIPELINE = (
-        "nvarguscamerasrc sensor-id=0 ! "
-        "video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! "
-        "nvvidconv ! "
-        "video/x-raw, format=BGRx ! "
-        "videoconvert ! "
-        "video/x-raw, format=BGR ! "
-        "appsink drop=1"
-    )
-    
-    print(f"Opening camera with GStreamer pipeline...")
-    # 수정: 파이프라인 변수와 백엔드 명시
-    cap = cv2.VideoCapture(GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
+    if not args.no_gstreamer:
+        GSTREAMER_PIPELINE = (
+            "nvarguscamerasrc sensor-id=0 sensor-mode=2 ! "
+            "video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! "
+            "nvvidconv ! "
+            "video/x-raw, format=BGRx ! "
+            "videoconvert ! "
+            "video/x-raw, format=BGR ! "
+            "appsink drop=1"
+        )
+        print(f"Opening camera with GStreamer pipeline...")
+        cap = cv2.VideoCapture(GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
+    else:
+        print(f"Opening camera {args.camera} (V4L2)...")
+        cap = cv2.VideoCapture(args.camera)
+
     if not cap.isOpened():
         print("Cannot open camera")
         return

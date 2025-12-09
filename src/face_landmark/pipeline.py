@@ -12,6 +12,15 @@ import numpy as np
 import onnx
 from onnx import helper as onnx_helper
 import torch
+import sys
+import os
+# Add src to sys.path to allow importing shared modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(current_dir, "..", "..", "src")
+if src_dir not in sys.path:
+    sys.path.append(src_dir)
+
+from shared.ort_wrapper import OrtWrapper
 from onnx2pytorch import ConvertModel
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,66 +100,14 @@ def _generate_ultraface_priors(input_w: int, input_h: int) -> np.ndarray:
     return np.array(priors, dtype=np.float32)
 
 
-class TorchOnnxWrapper:
-    """Wrap ONNX graph as torch module."""
-
-    def __init__(self, onnx_path: str, device: torch.device, precision: str = "fp16"):
-        model = onnx.load(onnx_path)
-        model = self._patch_conv_kernel_size(model)
-
-        self.model = None
-        last_err = None
-        for exp_flag in (True, False):
-            try:
-                self.model = ConvertModel(model, experimental=exp_flag)
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                continue
-        if self.model is None:
-            raise RuntimeError(f"Failed to convert ONNX to PyTorch: {last_err}") from last_err
-
-        self.model.eval()
-        if precision == "fp16":
-            self.model.half()
-        self.model.to(device)
-        self.device = device
-        self.precision = precision
-
-    def __call__(self, x: torch.Tensor):
-        with torch.no_grad():
-            return self.model(x)
-
-    @staticmethod
-    def _patch_conv_kernel_size(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
-        """Ensure Conv nodes expose kernel_size attr expected by onnx2pytorch."""
-        init_map = {init.name: init for init in onnx_model.graph.initializer}
-        for node in onnx_model.graph.node:
-            if node.op_type != "Conv":
-                continue
-            attr_names = {attr.name for attr in node.attribute}
-            if "kernel_size" in attr_names:
-                continue
-            kernel_shape_attr = next((a for a in node.attribute if a.name == "kernel_shape"), None)
-            kernel_shape = list(kernel_shape_attr.ints) if kernel_shape_attr is not None else None
-
-            if kernel_shape is None and len(node.input) > 1:
-                weight_name = node.input[1]
-                weight_init = init_map.get(weight_name)
-                if weight_init and len(weight_init.dims) >= 4:
-                    kernel_shape = [int(weight_init.dims[2]), int(weight_init.dims[3])]
-                    node.attribute.append(onnx_helper.make_attribute("kernel_shape", kernel_shape))
-
-            if kernel_shape is not None:
-                node.attribute.append(onnx_helper.make_attribute("kernel_size", kernel_shape))
-        return onnx_model
+# Remove TorchOnnxWrapper class definition
 
 
 class UltraFaceDetector:
-    """UltraFace RFB-320 face detector using PyTorch runtime."""
+    """UltraFace RFB-320 face detector using ONNX Runtime (via OrtWrapper)."""
 
     def __init__(self, onnx_path: str, device: torch.device, precision: str = "fp16"):
-        self.wrapper = TorchOnnxWrapper(onnx_path, device, precision=precision)
+        self.wrapper = OrtWrapper(onnx_path, device, precision)
         self.device = device
         self.precision = precision
         self.input_w = 320
@@ -166,7 +123,10 @@ class UltraFaceDetector:
         img = img.astype(np.float32)
         img = (img - 127.0) / 128.0
         img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
-        if self.precision == "fp16":
+        
+        if self.device.type == 'cpu':
+            img = img.float()
+        elif self.precision == "fp16":
             img = img.half()
         return img.to(self.device)
 
@@ -176,15 +136,24 @@ class UltraFaceDetector:
         outputs = self.wrapper(inp)
 
         if isinstance(outputs, dict):
-            loc = outputs.get("loc") or outputs.get("output_0")
-            conf = outputs.get("conf") or outputs.get("output_1")
+            loc = outputs.get("boxes") or outputs.get("loc")
+            conf = outputs.get("scores") or outputs.get("conf")
         elif isinstance(outputs, (list, tuple)):
-            loc, conf = outputs[0], outputs[1]
+            # UltraFace ONNX usually outputs [scores, boxes] -> [1, N, 2], [1, N, 4]
+            # But we need to be robust.
+            out1, out2 = outputs[0], outputs[1]
+            if out1.shape[-1] == 4:
+                loc, conf = out1, out2
+            else:
+                loc, conf = out2, out1
         else:
             raise RuntimeError("Unexpected UltraFace output type")
 
         loc = loc.detach().cpu().numpy().reshape(-1, 4)
         conf = conf.detach().cpu().numpy().reshape(-1, 2)
+
+
+
 
         boxes = np.concatenate((
             self.priors[:, :2] + loc[:, :2] * self.variances[0] * self.priors[:, 2:],

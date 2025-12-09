@@ -13,6 +13,15 @@ import numpy as np
 import onnx
 from onnx import helper as onnx_helper
 import torch
+import sys
+import os
+# Add src to sys.path to allow importing shared modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(current_dir, "..", "..", "src")
+if src_dir not in sys.path:
+    sys.path.append(src_dir)
+
+from shared.ort_wrapper import OrtWrapper
 from onnx2pytorch import ConvertModel
 
 # Paths
@@ -240,81 +249,13 @@ def draw_detections(frame: np.ndarray, detections: np.ndarray, scale: float, pad
 # Model wrappers
 # ============================================================
 
-class TorchOnnxWrapper:
-    """Wrap an ONNX graph as a PyTorch nn.Module via onnx2pytorch."""
-
-    def __init__(self, onnx_path: Union[str, Path], device: torch.device, precision: str = "fp16"):
-        onnx_model = onnx.load(str(onnx_path))
-        onnx_model = self._patch_conv_kernel_size(onnx_model)
-        onnx_model = self._remove_storage_order(onnx_model)
-
-        # Some ONNX exports miss kernel_size attr; patch + retry with/without experimental flag.
-        self.model = None
-        last_err = None
-        for exp_flag in (True, False):
-            try:
-                self.model = ConvertModel(onnx_model, experimental=exp_flag)
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                continue
-        if self.model is None:
-            raise RuntimeError(f"Failed to convert ONNX to PyTorch: {last_err}") from last_err
-
-        self.model.eval()
-        self.device = device
-        if precision == "fp16":
-            self.model.half()
-        self.model.to(device)
-
-    def __call__(self, x: torch.Tensor):
-        with torch.no_grad():
-            return self.model(x)
-
-    @staticmethod
-    def _patch_conv_kernel_size(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
-        """Ensure Conv/ConvTranspose nodes expose kernel_size attr expected by onnx2pytorch."""
-        init_map = {init.name: init for init in onnx_model.graph.initializer}
-        for node in onnx_model.graph.node:
-            if node.op_type not in ("Conv", "ConvTranspose"):
-                continue
-            attr_names = {attr.name for attr in node.attribute}
-            if "kernel_size" in attr_names:
-                continue
-            kernel_shape_attr = next((a for a in node.attribute if a.name == "kernel_shape"), None)
-            kernel_shape = list(kernel_shape_attr.ints) if kernel_shape_attr is not None else None
-
-            # If kernel_shape missing, infer from weight initializer
-            if kernel_shape is None and len(node.input) > 1:
-                weight_name = node.input[1]
-                weight_init = init_map.get(weight_name)
-                if weight_init and len(weight_init.dims) >= 4:
-                    # weight dims: [out_channels, in_channels/groups, kh, kw] (Conv)
-                    # or [in_channels, out_channels/groups, kh, kw] (ConvTranspose)
-                    kernel_shape = [int(weight_init.dims[2]), int(weight_init.dims[3])]
-                    node.attribute.append(onnx_helper.make_attribute("kernel_shape", kernel_shape))
-
-            if kernel_shape is not None:
-                # node.attribute.append(onnx_helper.make_attribute("kernel_size", kernel_shape))
-                pass
-        return onnx_model
-
-    @staticmethod
-    def _remove_storage_order(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
-        """Remove storage_order attribute from all nodes (not supported by onnx2pytorch)."""
-        for node in onnx_model.graph.node:
-            for i, attr in enumerate(node.attribute):
-                if attr.name == "storage_order":
-                    node.attribute.pop(i)
-                    break
-        return onnx_model
-
+# Removed TorchOnnxWrapper class definition as per instruction
 
 class TorchPalmDetector:
-    """Palm detector using PyTorch (converted from ONNX)."""
+    """Palm detector using ONNX Runtime (via OrtWrapper)."""
 
     def __init__(self, onnx_path: Union[str, Path], device: torch.device, precision: str = "fp16"):
-        self.wrapper = TorchOnnxWrapper(onnx_path, device, precision)
+        self.wrapper = OrtWrapper(onnx_path, device, precision)
         self.device = device
         self.precision = precision
         self.anchors = generate_palm_anchors()
@@ -329,25 +270,35 @@ class TorchPalmDetector:
         """Run detection on a 256x256 RGB image."""
         inp = img.astype(np.float32) / 255.0
         inp = torch.from_numpy(inp).permute(2, 0, 1).unsqueeze(0)  # NCHW
-        if self.precision == "fp16":
+        if self.device.type == 'cpu':
+            inp = inp.float()
+        elif self.precision == "fp16":
             inp = inp.half()
+            
         inp = inp.to(self.device)
 
         outputs = self.wrapper(inp)
-        if isinstance(outputs, dict):
-            raw_boxes = outputs.get("boxes") or outputs.get("output_0")
-            raw_scores = outputs.get("scores") or outputs.get("output_1")
-        elif isinstance(outputs, (list, tuple)):
-            raw_boxes, raw_scores = outputs[0], outputs[1]
+        # outputs is list of tensors
+        
+        # Palm detector: [regressors (N, 18), classificators (N, 1)]
+        # Check shapes to be robust
+        if len(outputs) == 2:
+            out1, out2 = outputs[0], outputs[1]
+            # regressors has last dim 18, classificators has 1
+            if out1.shape[-1] == 18:
+                raw_boxes, raw_scores = out1, out2
+            else:
+                raw_boxes, raw_scores = out2, out1
         else:
-            raise RuntimeError("Unexpected detector output type")
+             # Fallback
+             raw_boxes, raw_scores = outputs[0], outputs[1]
 
         raw_boxes = raw_boxes.detach().cpu().numpy()
         raw_scores = raw_scores.detach().cpu().numpy()
 
-        if raw_boxes.ndim == 4:
+        if raw_boxes.ndim == 3:
             raw_boxes = raw_boxes[0]
-        if raw_scores.ndim == 4:
+        if raw_scores.ndim == 3:
             raw_scores = raw_scores[0]
 
         detections = self._decode(raw_boxes, raw_scores)
@@ -388,10 +339,10 @@ class TorchPalmDetector:
 
 
 class TorchHandLandmark:
-    """Hand landmark model using PyTorch (converted from ONNX)."""
+    """Hand landmark model using ONNX Runtime (via OrtWrapper)."""
 
     def __init__(self, onnx_path: Union[str, Path], device: torch.device, precision: str = "fp16"):
-        self.wrapper = TorchOnnxWrapper(onnx_path, device, precision)
+        self.wrapper = OrtWrapper(onnx_path, device, precision)
         self.device = device
         self.precision = precision
 
@@ -404,30 +355,60 @@ class TorchHandLandmark:
         if inp.ndim == 3:
             inp = inp[None]
         inp = torch.from_numpy(inp).permute(0, 3, 1, 2)  # NCHW
-        if self.precision == "fp16":
+        
+        if self.device.type == 'cpu':
+            inp = inp.float()
+        elif self.precision == "fp16":
             inp = inp.half()
         inp = inp.to(self.device)
 
         outputs = self.wrapper(inp)
-        if isinstance(outputs, dict):
-            flags = outputs.get("flag") or outputs.get("output_0")
-            handed = outputs.get("handedness") or outputs.get("output_1")
-            landmarks = outputs.get("landmarks") or outputs.get("output_2")
-        elif isinstance(outputs, (list, tuple)):
-            if len(outputs) == 3:
-                flags, handed, landmarks = outputs
-            elif len(outputs) == 2:
-                flags, landmarks = outputs
-                handed = torch.zeros_like(flags)
-            else:
-                flags = outputs[0]
-                handed = torch.zeros_like(flags)
-                landmarks = torch.zeros((len(flags), 21, 3), device=flags.device)
-        else:
-            raise RuntimeError("Unexpected landmark output type")
+        # outputs: [flag, handedness, landmarks] or similar
+        # flag: (1,1), handedness: (1,1), landmarks: (1, 63)
+        
+        flags, handed, landmarks = None, None, None
+        
+        # Try to identify outputs by shape
+        for out in outputs:
+            shape = out.shape
+            if shape[-1] == 63: # Landmarks have 63 elements (21*3)
+                landmarks = out
+            elif shape[-1] == 1: # Flag or handedness have 1 element
+                if flags is None: # Assume first 1-element output is flag
+                    flags = out
+                else: # Second 1-element output is handedness
+                    handed = out
+        
+        # If we can't distinguish by shape (e.g., if there are multiple 1-element outputs
+        # and the order is not guaranteed, or if some outputs are missing),
+        # we fall back to assuming a specific order if the number of outputs matches.
+        # Based on common MediaPipe models, the order is often flag, handedness, landmarks.
+        if flags is None and handed is None and landmarks is None and len(outputs) == 3:
+            # Assuming order: flag, handedness, landmarks
+            flags, handed, landmarks = outputs[0], outputs[1], outputs[2]
+            
+            # Verify landmarks shape, if not 63, try to find it
+            if landmarks.shape[-1] != 63:
+                for i, o in enumerate(outputs):
+                    if o.shape[-1] == 63:
+                        landmarks = o
+                        # Reassign flags and handedness from remaining outputs
+                        others = [x for k, x in enumerate(outputs) if k != i]
+                        if len(others) == 2:
+                            flags, handed = others[0], others[1]
+                        elif len(others) == 1: # Only one other output, assume it's flag
+                            flags = others[0]
+                            handed = torch.zeros_like(flags) # Default handedness
+                        break
+        
+        # Provide default tensors if any output is still None
+        if flags is None: flags = torch.zeros((len(inp), 1), device=self.device)
+        if handed is None: handed = torch.zeros((len(inp), 1), device=self.device)
+        if landmarks is None: landmarks = torch.zeros((len(inp), 63), device=self.device)
 
         flags = flags.detach().cpu().numpy().flatten()
         handed = handed.detach().cpu().numpy().flatten()
+
         landmarks = landmarks.detach().cpu().numpy().reshape(-1, 21, 3).astype(np.float32)
         return flags, handed, landmarks
 
@@ -474,22 +455,12 @@ class HandTrackingPipeline:
             self.landmark = TorchHandLandmark(lm_path, self.device, precision=self.precision)
 
             if self.prune_ratio > 0:
-                print(f"[HandTracking] Applying structured pruning (ratio={self.prune_ratio})...")
-                self._prune_model(self.detector.wrapper.model, self.prune_ratio)
-                self._prune_model(self.landmark.wrapper.model, self.prune_ratio)
+                print(f"[HandTracking] Using pruned model (ratio={self.prune_ratio}) from {det_path.name}")
+                # Runtime pruning via torch.nn.utils.prune is not supported with ONNX Runtime backend.
+                # We rely on loading the pre-pruned ONNX file resolved above.
 
         self.det_size = det_path.stat().st_size / (1024 * 1024)
         self.lm_size = lm_path.stat().st_size / (1024 * 1024)
-
-    def _prune_model(self, model: torch.nn.Module, ratio: float):
-        """Apply structured pruning (L1 norm) to Conv2d layers."""
-        import torch.nn.utils.prune as prune
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Conv2d):
-                # Prune filters (dim=0) based on L1 norm
-                prune.ln_structured(module, name="weight", amount=ratio, n=1, dim=0)
-                # Make pruning permanent (remove mask, modify weight directly)
-                prune.remove(module, "weight")
 
     def process_frame(self, frame: np.ndarray):
         """Process a single BGR frame. Returns (landmarks, detections, scale, pad)."""
