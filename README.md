@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Emoji Reactor (PyTorch runtime)
 
 Cleaned repository focused on a PyTorch-only hand/face pipeline and the emoji/monkey reactor demo with pruning/quantization options.
@@ -58,3 +59,6 @@ python src/emoji_reactor/app.py --precision fp32 --prune 0.0
 ## Notes
 - Assets live in `assets/emojis` and `assets/audio`; place additional emoji sets there if needed.
 - ONNX models are cached in `assets/models`; they'll be generated on first run.
+=======
+# Embedded_AI
+>>>>>>> c1e95a5438b4e7ef8db506243adadc3cffdca8af
