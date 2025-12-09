@@ -3,8 +3,7 @@ mediapipe
 numpy
 torch
 onnx
-onnxruntime
-onnxconverter-common
+onnx2pytorch
 sounddevice
 vosk
 transformers

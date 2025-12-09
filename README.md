@@ -1,18 +1,18 @@
-# Emoji Reactor (ONNX + MediaPipe Hand Tracking)
+# Emoji Reactor (PyTorch runtime)
 
-Cleaned repository focused on the ONNX hand-tracking pipeline and the emoji/monkey reactor demo with pruning/quantization options.
+Cleaned repository focused on a PyTorch-only hand/face pipeline and the emoji/monkey reactor demo with pruning/quantization options.
 
 ## Layout
-- `src/hand_tracking/` — pipeline + MediaPipe PyTorch weights/code (`mediapipe_pytorch`).
+- `src/hand_tracking/` — PyTorch-only pipeline that converts the cached ONNX models with onnx2pytorch (no onnxruntime).
 - `src/emoji_reactor/app.py` — main demo (emoji/monkey modes, gestures, optional voice, background music).
 - `assets/emojis/` — emoji images (default + monkey variants).
 - `assets/audio/` — background music (`yessir.mp3`).
-- `assets/models/` — cached/exported ONNX models (auto-created).
+- `assets/models/` — cached/exported ONNX models (converted to PyTorch at runtime).
 - `demos/simple_hand_app.py` — minimal hand-tracking viewer.
 
 ## Quickstart
 ```bash
-pip install -r requirements.txt  # include onnxruntime, mediapipe, etc.
+pip install -r requirements.txt  # includes onnx2pytorch, mediapipe, etc.
 
 # Emoji reactor (emoji mode by default)
 python src/emoji_reactor/app.py --precision fp16 --prune 0.0

@@ -1,461 +1,291 @@
 # face_landmark/pipeline.py
-# GPU-accelerated Face Landmark Detection using ONNX Runtime
-# Replaces MediaPipe Face Mesh for better Jetson Nano performance
-# Supports FP16/INT8 quantization like hand_tracking pipeline
+# PyTorch face detector (UltraFace) + lightweight MAR estimation.
+# Fully removes OpenCV/ONNXRuntime inference and keeps a single torch path.
 
 import os
-import sys
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 import onnx
-import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType
+import torch
+from onnx2pytorch import ConvertModel
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "assets" / "models"
 
-# Model URLs (lightweight models for embedded devices)
+# Model URL (lightweight, reliable)
 MODEL_URLS = {
-    # Ultra-Light-Fast face detector (works with any ONNX runtime)
-    "face_detector_onnx": [
-        "https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/raw/master/models/onnx/version-RFB-320.onnx",
-    ],
-    # Multiple fallback URLs for face landmark model
-    "face_landmark_68": [
-        "https://github.com/atksh/onnx-facial-lmk-detector/releases/download/v0.0.1/facial_lmk_detector.onnx",
-    ],
-}
-
-# 68-landmark mouth indices (for smile detection)
-MOUTH_LANDMARKS_68 = {
-    "left_corner": 48,
-    "right_corner": 54,
-    "upper_lip": 62,
-    "lower_lip": 66,
+    "ultraface_onnx": "https://raw.githubusercontent.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/master/models/onnx/version-RFB-320_simplified.onnx",
 }
 
 
-def _select_providers():
-    """Pick the fastest available ONNX Runtime providers (TensorRT > CUDA > CPU)."""
-    preferred = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-    available = set(ort.get_available_providers())
-    return [p for p in preferred if p in available]
+def download_file(url: str, filepath: str) -> str:
+    """Download file if not exists."""
+    if os.path.exists(filepath):
+        return filepath
 
-
-def download_model(name: str, urls) -> str:
-    """Download model if not exists. Supports single URL or list of fallback URLs."""
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    filename = f"{name}.onnx"
-    filepath = MODEL_DIR / filename
-
-    if filepath.exists():
-        return str(filepath)
-
-    # Handle both single URL and list of URLs
-    url_list = urls if isinstance(urls, list) else [urls]
-
-    print(f"[FaceLandmark] Downloading {name}...")
-    last_error = None
-    for url in url_list:
-        try:
-            print(f"[FaceLandmark] Trying: {url}")
-            urllib.request.urlretrieve(url, filepath)
-            print(f"[FaceLandmark] Downloaded to {filepath}")
-            return str(filepath)
-        except Exception as e:
-            last_error = e
-            print(f"[FaceLandmark] Failed: {e}")
-            continue
-
-    raise last_error or Exception(f"All download URLs failed for {name}")
-
-
-def convert_to_fp16(src_path: str, dst_path: str) -> str:
-    """Convert ONNX model to FP16."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    print(f"[FaceLandmark] Downloading {os.path.basename(filepath)}...")
     try:
-        from onnxconverter_common import float16
-    except ImportError:
-        print("[FaceLandmark] onnxconverter_common not installed, skipping FP16 conversion")
-        return src_path
-
-    if os.path.exists(dst_path):
-        return dst_path
-
-    print(f"[FaceLandmark] Converting to FP16: {dst_path}")
-    model = onnx.load(src_path)
-    model_fp16 = float16.convert_float_to_float16(model, keep_io_types=True)
-    onnx.save(model_fp16, dst_path)
-    return dst_path
+        urllib.request.urlretrieve(url, filepath)
+        print(f"[FaceLandmark] Downloaded to {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"[FaceLandmark] Download failed: {e}")
+        raise
 
 
-def convert_to_int8(src_path: str, dst_path: str) -> str:
-    """Convert ONNX model to INT8 (dynamic quantization)."""
-    if os.path.exists(dst_path):
-        return dst_path
-
-    print(f"[FaceLandmark] Converting to INT8: {dst_path}")
-    quantize_dynamic(src_path, dst_path, weight_type=QuantType.QUInt8)
-    return dst_path
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x, axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=1, keepdims=True)
 
 
-def get_model_path(base_name: str, precision: str) -> str:
-    """Get model path with precision suffix."""
-    if precision == 'fp32':
-        return str(MODEL_DIR / f"{base_name}.onnx")
-    elif precision == 'fp16':
-        return str(MODEL_DIR / f"{base_name}_fp16.onnx")
-    elif precision == 'int8':
-        return str(MODEL_DIR / f"{base_name}_int8.onnx")
-    return str(MODEL_DIR / f"{base_name}.onnx")
+def _nms(boxes: np.ndarray, scores: np.ndarray, thresh: float = 0.35, top_k: int = 200) -> list:
+    """Standard NMS for UltraFace."""
+    order = scores.argsort()[::-1][:top_k]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+        xx1 = np.maximum(boxes[i, 0], boxes[order[1:], 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[order[1:], 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[order[1:], 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[order[1:], 3])
+
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        ovr = inter / ((
+            (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1]) +
+            (boxes[order[1:], 2] - boxes[order[1:], 0]) *
+            (boxes[order[1:], 3] - boxes[order[1:], 1]) - inter
+        ) + 1e-6)
+        inds = np.where(ovr <= thresh)[0]
+        order = order[inds + 1]
+    return keep
 
 
-class ONNXFaceDetector:
-    """Ultra-Light-Fast face detector using ONNX Runtime."""
+def _generate_ultraface_priors(input_w: int, input_h: int) -> np.ndarray:
+    """Generate priors for UltraFace RFB-320."""
+    min_sizes = [[10, 16, 24], [32, 48], [64, 96], [128, 192, 256]]
+    steps = [8, 16, 32, 64]
+    feature_maps = [[int(np.ceil(input_h / step)), int(np.ceil(input_w / step))] for step in steps]
 
-    def __init__(self, model_path: str, providers: List[str] = None):
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    priors = []
+    for k, f in enumerate(feature_maps):
+        for i in range(f[0]):
+            for j in range(f[1]):
+                for min_size in min_sizes[k]:
+                    s_kx = min_size / input_w
+                    s_ky = min_size / input_h
+                    cx = (j + 0.5) * steps[k] / input_w
+                    cy = (i + 0.5) * steps[k] / input_h
+                    priors.append([cx, cy, s_kx, s_ky])
+    return np.array(priors, dtype=np.float32)
 
-        self.session = ort.InferenceSession(
-            model_path, sess_options,
-            providers=providers or _select_providers()
-        )
-        self.input_name = self.session.get_inputs()[0].name
-        self.input_shape = self.session.get_inputs()[0].shape
-        # Ultra-Light-Fast uses 320x240 or 640x480
-        self.input_size = (320, 240)
-        self.score_threshold = 0.7
+
+class TorchOnnxWrapper:
+    """Wrap ONNX graph as torch module."""
+
+    def __init__(self, onnx_path: str, device: torch.device, precision: str = "fp16"):
+        model = onnx.load(onnx_path)
+        self.model = ConvertModel(model, experimental=True)
+        self.model.eval()
+        if precision == "fp16":
+            self.model.half()
+        self.model.to(device)
+        self.device = device
+        self.precision = precision
+
+    def __call__(self, x: torch.Tensor):
+        with torch.no_grad():
+            return self.model(x)
+
+
+class UltraFaceDetector:
+    """UltraFace RFB-320 face detector using PyTorch runtime."""
+
+    def __init__(self, onnx_path: str, device: torch.device, precision: str = "fp16"):
+        self.wrapper = TorchOnnxWrapper(onnx_path, device, precision=precision)
+        self.device = device
+        self.precision = precision
+        self.input_w = 320
+        self.input_h = 240
+        self.priors = _generate_ultraface_priors(self.input_w, self.input_h)
+        self.variances = [0.1, 0.2]
+        self.conf_threshold = 0.6
+        self.nms_threshold = 0.35
+        self.top_k = 200
+
+    def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
+        img = cv2.resize(frame, (self.input_w, self.input_h))
+        img = img.astype(np.float32)
+        img = (img - 127.0) / 128.0
+        img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+        if self.precision == "fp16":
+            img = img.half()
+        return img.to(self.device)
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
-        """Detect faces. Returns array of [x, y, w, h, score]."""
-        h, w = frame.shape[:2]
+        """Return array of [x, y, w, h, score]."""
+        inp = self._preprocess(frame)
+        outputs = self.wrapper(inp)
 
-        # Preprocess
-        img = cv2.resize(frame, self.input_size)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32)
-        img = (img - 127.0) / 128.0  # Normalize to [-1, 1]
-        img = img.transpose(2, 0, 1)[None]  # NCHW
+        if isinstance(outputs, dict):
+            loc = outputs.get("loc") or outputs.get("output_0")
+            conf = outputs.get("conf") or outputs.get("output_1")
+        elif isinstance(outputs, (list, tuple)):
+            loc, conf = outputs[0], outputs[1]
+        else:
+            raise RuntimeError("Unexpected UltraFace output type")
 
-        # Inference
-        outputs = self.session.run(None, {self.input_name: img})
-        confidences = outputs[0][0]  # (num_anchors, 2)
-        boxes = outputs[1][0]  # (num_anchors, 4)
+        loc = loc.detach().cpu().numpy().reshape(-1, 4)
+        conf = conf.detach().cpu().numpy().reshape(-1, 2)
 
-        # Filter by confidence
-        scores = confidences[:, 1]  # Face confidence
-        mask = scores > self.score_threshold
-        if not mask.any():
+        boxes = np.concatenate((
+            self.priors[:, :2] + loc[:, :2] * self.variances[0] * self.priors[:, 2:],
+            self.priors[:, 2:] * np.exp(loc[:, 2:] * self.variances[1])
+        ), axis=1)
+
+        boxes[:, :2] -= boxes[:, 2:] / 2
+        boxes[:, 2:] += boxes[:, :2]
+
+        scores = _softmax(conf)[:, 1]
+
+        mask = scores > self.conf_threshold
+        boxes = boxes[mask]
+        scores = scores[mask]
+
+        if len(boxes) == 0:
             return np.array([])
 
-        scores = scores[mask]
-        boxes = boxes[mask]
+        # Scale to original frame size
+        h, w = frame.shape[:2]
+        boxes[:, [0, 2]] *= w
+        boxes[:, [1, 3]] *= h
 
-        # Convert from [x1, y1, x2, y2] normalized to [x, y, w, h] in pixels
-        scale_x = w / self.input_size[0]
-        scale_y = h / self.input_size[1]
+        keep = _nms(boxes, scores, thresh=self.nms_threshold, top_k=self.top_k)
+        boxes = boxes[keep]
+        scores = scores[keep]
 
         faces = []
-        for box, score in zip(boxes, scores):
-            x1 = int(box[0] * w)
-            y1 = int(box[1] * h)
-            x2 = int(box[2] * w)
-            y2 = int(box[3] * h)
-            faces.append([x1, y1, x2 - x1, y2 - y1, score])
-
+        for b, s in zip(boxes, scores):
+            x1, y1, x2, y2 = b
+            faces.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1), float(s)])
         return np.array(faces) if faces else np.array([])
 
 
-class ONNXFaceLandmark:
-    """ONNX-based 68-point face landmark detector."""
-
-    def __init__(self, model_path: str, providers: List[str] = None):
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.intra_op_num_threads = 4
-
-        self.session = ort.InferenceSession(
-            model_path, sess_options,
-            providers=providers or _select_providers()
-        )
-        self.input_name = self.session.get_inputs()[0].name
-        self.input_shape = self.session.get_inputs()[0].shape
-        # Typically [1, 3, 192, 192] or similar
-        self.input_size = (self.input_shape[3], self.input_shape[2])
-
-    def predict(self, face_img: np.ndarray) -> np.ndarray:
-        """Predict 68 landmarks from cropped face image.
-
-        Args:
-            face_img: BGR face crop
-
-        Returns:
-            landmarks: (68, 2) array of (x, y) normalized to [0, 1]
-        """
-        # Preprocess
-        img = cv2.resize(face_img, self.input_size)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        img = img.transpose(2, 0, 1)[None]  # NCHW
-
-        # Inference
-        outputs = self.session.run(None, {self.input_name: img})
-
-        # Parse output - shape varies by model
-        landmarks = outputs[0]
-        if landmarks.ndim == 3:
-            landmarks = landmarks[0]
-        landmarks = landmarks.reshape(-1, 2)
-
-        return landmarks
-
-
-class SimpleFaceLandmark:
-    """Simpler approach using OpenCV's built-in face landmark detection.
-    Falls back to this if ONNX model download fails."""
+class RatioBasedMAR:
+    """Simple ratio-based smile detection using face proportions (no face mesh)."""
 
     def __init__(self):
-        # Use dlib-style facial landmark indices mapping
-        # OpenCV's LBF model outputs 68 landmarks
-        self.model_path = None
-        self.facemark = None
+        self.prev_mar = 0.0
+        self.smoothing = 0.3
 
-        try:
-            # Try to create LBF facemark
-            self.facemark = cv2.face.createFacemarkLBF()
-            # Try common model paths
-            model_paths = [
-                "/usr/share/opencv4/lbfmodel.yaml",
-                str(MODEL_DIR / "lbfmodel.yaml"),
-            ]
-            for path in model_paths:
-                if os.path.exists(path):
-                    self.facemark.loadModel(path)
-                    self.model_path = path
-                    break
-        except Exception:
-            self.facemark = None
+    def estimate_from_face(self, frame: np.ndarray, face_box: np.ndarray) -> Tuple[float, np.ndarray]:
+        x, y, w, h = face_box
+        mouth_y = y + int(h * 0.65)
+        mouth_x = x + w // 2
+        mouth_width = int(w * 0.5)
+        mouth_height = int(h * 0.15)
 
-    @property
-    def is_available(self):
-        return self.facemark is not None and self.model_path is not None
+        mouth_y1 = max(0, mouth_y - mouth_height // 2)
+        mouth_y2 = min(frame.shape[0], mouth_y + mouth_height // 2)
+        mouth_x1 = max(0, mouth_x - mouth_width // 2)
+        mouth_x2 = min(frame.shape[1], mouth_x + mouth_width // 2)
+
+        mouth_roi = frame[mouth_y1:mouth_y2, mouth_x1:mouth_x2]
+        if mouth_roi.size == 0:
+            return self.prev_mar, np.array([mouth_x, mouth_y])
+
+        gray = cv2.cvtColor(mouth_roi, cv2.COLOR_BGR2GRAY) if len(mouth_roi.shape) == 3 else mouth_roi
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        variance = np.var(gray) / 255.0
+
+        mar = edge_density * 0.5 + variance * 0.3
+        mar = max(0.0, min(1.0, mar))
+        mar = self.smoothing * mar + (1 - self.smoothing) * self.prev_mar
+        self.prev_mar = mar
+
+        return mar, np.array([mouth_x, mouth_y])
 
 
 class FaceLandmarkPipeline:
-    """GPU-accelerated face landmark pipeline for Jetson Nano."""
+    """PyTorch face detection pipeline for Jetson Nano + MAR estimation."""
 
     def __init__(
         self,
-        precision: str = 'fp16',
-        providers: List[str] = None,
+        precision: str = "fp16",
+        use_cuda: bool = True,
     ):
         self.precision = precision
-        self.providers = providers or _select_providers()
+        self.device = torch.device('cuda' if use_cuda and torch.cuda.is_available() else 'cpu')
 
-        # Download/load models
-        print("[FaceLandmark] Initializing GPU-accelerated face landmark pipeline...")
-        print(f"[FaceLandmark] Available providers: {self.providers}")
+        print("[FaceLandmark] Initializing face detection pipeline...")
+        print(f"[FaceLandmark] Device: {self.device}")
 
-        # Face detector (ONNX-based Ultra-Light-Fast detector)
+        self.detector = None
         try:
-            det_path = download_model("face_detector_onnx", MODEL_URLS["face_detector_onnx"])
-            self.detector = ONNXFaceDetector(det_path, providers=self.providers)
-            print("[FaceLandmark] ONNX face detector loaded")
+            ultraface_path = str(MODEL_DIR / "ultraface_rfb_320_simplified.onnx")
+            download_file(MODEL_URLS["ultraface_onnx"], ultraface_path)
+            self.detector = UltraFaceDetector(ultraface_path, self.device, precision=self.precision)
+            print("[FaceLandmark] UltraFace detector loaded (PyTorch)")
         except Exception as e:
-            print(f"[FaceLandmark] ONNX face detector load failed: {e}, trying Haar cascade")
+            print(f"[FaceLandmark] Face detector failed: {e}")
             self.detector = None
 
-        # Haar cascade fallback
-        if self.detector is None:
-            # Handle both pip opencv and apt-get python3-opencv
-            cascade_paths = [
-                "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",  # apt-get opencv4
-                "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",   # apt-get opencv3
-                "/usr/share/OpenCV/haarcascades/haarcascade_frontalface_default.xml",   # older versions
-                # Jetson Nano specific paths
-                "/usr/share/opencv4/lbpcascades/../haarcascades/haarcascade_frontalface_default.xml",
-            ]
-            # Try cv2.data first (pip install opencv-python)
-            if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
-                cascade_paths.insert(0, cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-            # Also try to find via locate or common package paths
-            import glob
-            extra_paths = glob.glob("/usr/share/**/haarcascade_frontalface_default.xml", recursive=True)
-            cascade_paths.extend(extra_paths)
-
-            cascade_path = None
-            for path in cascade_paths:
-                if os.path.exists(path):
-                    cascade_path = path
-                    break
-
-            if cascade_path:
-                self.haar_cascade = cv2.CascadeClassifier(cascade_path)
-                if self.haar_cascade.empty():
-                    print(f"[FaceLandmark] Warning: Haar cascade loaded but empty: {cascade_path}")
-                    self.haar_cascade = None
-                else:
-                    print(f"[FaceLandmark] Using Haar cascade: {cascade_path}")
-            else:
-                print("[FaceLandmark] Warning: No Haar cascade found")
-                self.haar_cascade = None
-        else:
-            self.haar_cascade = None
-
-        # Face landmark model with precision conversion
-        try:
-            base_path = download_model("face_landmark_68", MODEL_URLS["face_landmark_68"])
-            lm_path = self._prepare_model(base_path, "face_landmark_68", precision)
-            self.landmark_model = ONNXFaceLandmark(lm_path, providers=self.providers)
-            self.lm_size = os.path.getsize(lm_path) / (1024 * 1024)
-            print(f"[FaceLandmark] ONNX landmark model loaded ({precision}, {self.lm_size:.2f}MB)")
-        except Exception as e:
-            print(f"[FaceLandmark] ONNX landmark load failed: {e}")
-            self.landmark_model = None
-            self.lm_size = 0
-
-        # Stats
-        self._det_time = 0
-        self._lm_time = 0
-
-    def _prepare_model(self, base_path: str, base_name: str, precision: str) -> str:
-        """Prepare model with specified precision."""
-        if precision == 'fp32':
-            return base_path
-        elif precision == 'fp16':
-            dst_path = get_model_path(base_name, 'fp16')
-            return convert_to_fp16(base_path, dst_path)
-        elif precision == 'int8':
-            dst_path = get_model_path(base_name, 'int8')
-            return convert_to_int8(base_path, dst_path)
-        return base_path
+        self.mar_estimator = RatioBasedMAR()
 
     def process_frame(self, frame: np.ndarray) -> Tuple[Optional[np.ndarray], float, Optional[np.ndarray]]:
-        """Process frame and return face landmarks.
-
-        Args:
-            frame: BGR image
-
-        Returns:
-            landmarks: (68, 2) array in image coordinates, or None
-            mar: mouth aspect ratio for smile detection
-            face_box: [x, y, w, h] of detected face, or None
-        """
-        h, w = frame.shape[:2]
-
-        # Detect faces
-        if self.detector is not None:
-            faces = self.detector.detect(frame)
-        elif self.haar_cascade is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            rects = self.haar_cascade.detectMultiScale(gray, 1.1, 4)
-            if len(rects) > 0:
-                # Convert to same format as YuNet [x, y, w, h, ...]
-                faces = np.array([[x, y, w, h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0]
-                                  for (x, y, w, h) in rects])
-            else:
-                faces = np.array([])
-        else:
+        """Process frame and return (landmarks, mar, face_box)."""
+        if self.detector is None:
             return None, 0.0, None
 
+        faces = self.detector.detect(frame)
         if len(faces) == 0:
             return None, 0.0, None
 
-        # Use largest face
-        face = faces[0]
-        x, y, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
+        if len(faces) > 1:
+            areas = faces[:, 2] * faces[:, 3]
+            face = faces[np.argmax(areas)]
+        else:
+            face = faces[0]
 
-        # Expand face box slightly for better landmark detection
-        pad = int(max(fw, fh) * 0.1)
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(w, x + fw + pad)
-        y2 = min(h, y + fh + pad)
+        face_box = np.array([int(face[0]), int(face[1]), int(face[2]), int(face[3])])
+        mar, _ = self.mar_estimator.estimate_from_face(frame, face_box)
+        return None, mar, face_box
 
-        face_crop = frame[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            return None, 0.0, None
-
-        face_box = np.array([x, y, fw, fh])
-
-        # Get landmarks
-        if self.landmark_model is not None:
-            landmarks_norm = self.landmark_model.predict(face_crop)
-
-            # Denormalize to image coordinates
-            crop_h, crop_w = face_crop.shape[:2]
-            landmarks = landmarks_norm.copy()
-            landmarks[:, 0] = landmarks_norm[:, 0] * crop_w + x1
-            landmarks[:, 1] = landmarks_norm[:, 1] * crop_h + y1
-
-            # Calculate mouth aspect ratio
-            mar = self._calculate_mar(landmarks)
-
-            return landmarks, mar, face_box
-
-        return None, 0.0, face_box
-
-    def _calculate_mar(self, landmarks: np.ndarray) -> float:
-        """Calculate mouth aspect ratio from 68-point landmarks."""
-        if len(landmarks) < 68:
-            return 0.0
-
-        # Mouth corners and lips
-        left_corner = landmarks[MOUTH_LANDMARKS_68["left_corner"]]
-        right_corner = landmarks[MOUTH_LANDMARKS_68["right_corner"]]
-        upper_lip = landmarks[MOUTH_LANDMARKS_68["upper_lip"]]
-        lower_lip = landmarks[MOUTH_LANDMARKS_68["lower_lip"]]
-
-        # Calculate distances
-        mouth_width = np.linalg.norm(right_corner - left_corner)
-        mouth_height = np.linalg.norm(lower_lip - upper_lip)
-
-        if mouth_width <= 0:
-            return 0.0
-
-        return mouth_height / mouth_width
-
-    def get_mouth_center(self, landmarks: np.ndarray) -> Optional[np.ndarray]:
-        """Get mouth center from landmarks."""
-        if landmarks is None or len(landmarks) < 68:
-            return None
-
-        upper_lip = landmarks[MOUTH_LANDMARKS_68["upper_lip"]]
-        lower_lip = landmarks[MOUTH_LANDMARKS_68["lower_lip"]]
-
-        return (upper_lip + lower_lip) / 2
+    def get_mouth_center(self, landmarks: np.ndarray = None, face_box: np.ndarray = None) -> Optional[np.ndarray]:
+        """Get mouth center estimate from face box."""
+        del landmarks  # unused
+        if face_box is not None:
+            x, y, w, h = face_box
+            return np.array([x + w // 2, y + int(h * 0.65)])
+        return None
 
     def print_stats(self):
-        """Print pipeline info."""
-        print(f"[FaceLandmark] Providers: {self.providers}")
+        print(f"[FaceLandmark] Device: {self.device}")
         print(f"[FaceLandmark] Precision: {self.precision}")
-        det_type = "ONNX" if self.detector else ("Haar" if self.haar_cascade else "None")
+        det_type = "UltraFace (PyTorch)" if self.detector else "None"
         print(f"[FaceLandmark] Detector: {det_type}")
-        print(f"[FaceLandmark] Landmark: {'ONNX 68-point' if self.landmark_model else 'None'} ({self.lm_size:.2f}MB)")
+        print(f"[FaceLandmark] MAR: Ratio-based estimation")
 
 
-def draw_face_landmarks(frame: np.ndarray, landmarks: np.ndarray, color=(0, 255, 0)):
-    """Draw face landmarks on frame."""
-    if landmarks is None:
+def draw_face_box(frame: np.ndarray, face_box: np.ndarray, color=(255, 0, 0)):
+    """Draw face bounding box on frame."""
+    if face_box is None:
         return
-
-    for i, (x, y) in enumerate(landmarks):
-        cv2.circle(frame, (int(x), int(y)), 1, color, -1)
-
-    # Draw mouth outline
-    mouth_indices = list(range(48, 68))
-    for i in range(len(mouth_indices) - 1):
-        pt1 = landmarks[mouth_indices[i]].astype(int)
-        pt2 = landmarks[mouth_indices[i + 1]].astype(int)
-        cv2.line(frame, tuple(pt1), tuple(pt2), (0, 200, 255), 1)
+    x, y, w, h = face_box
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
 
-# Test
 if __name__ == "__main__":
     pipeline = FaceLandmarkPipeline()
     pipeline.print_stats()
@@ -463,7 +293,7 @@ if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Cannot open camera")
-        exit()
+        raise SystemExit
 
     import time
     fps_list = []
@@ -485,22 +315,18 @@ if __name__ == "__main__":
             fps_list.pop(0)
         avg_fps = np.mean(fps_list)
 
-        if landmarks is not None:
-            draw_face_landmarks(frame, landmarks)
-
         if face_box is not None:
-            x, y, w, h = face_box
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            draw_face_box(frame, face_box)
+            mouth_center = pipeline.get_mouth_center(None, face_box)
+            if mouth_center is not None:
+                cv2.circle(frame, tuple(mouth_center.astype(int)), 5, (0, 255, 255), -1)
 
         cv2.putText(frame, f"FPS: {avg_fps:.1f} MAR: {mar:.2f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        smile = "SMILING" if mar > 0.3 else ""
-        cv2.putText(frame, smile, (10, 60),
+        cv2.putText(frame, "SMILING" if mar > 0.3 else "", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        cv2.imshow("Face Landmarks", frame)
-
+        cv2.imshow("Face Detection", frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
 

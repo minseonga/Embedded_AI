@@ -1,5 +1,5 @@
 """
-Emoji Reactor powered by our ONNX hand-tracking pipeline (pruning/quantization)
+Emoji Reactor powered by our PyTorch hand-tracking pipeline (pruning/quantization)
 plus keyword-based mode switching (emoji ↔ monkey) via optional Vosk ASR.
 
 States:

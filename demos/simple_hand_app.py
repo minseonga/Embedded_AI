@@ -3,7 +3,7 @@ Simple hand-tracking viewer inspired by simple-mediapipe-project.
 
 - Single-window, minimal HUD
 - Keeps pruning/quantization knobs (`--precision`, `--prune`)
-- Uses the HandTrackingPipeline for ONNX+TensorRT/CUDA/CPU backends
+- Uses the PyTorch-only HandTrackingPipeline (onnx2pytorch)
 """
 
 import argparse
@@ -81,7 +81,7 @@ def main():
     parser = argparse.ArgumentParser(description="Minimal hand-tracking viewer.")
     parser.add_argument('--camera', type=int, default=0, help='Camera index (default: 0)')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'int8'], default='fp16',
-                        help='Model precision. Use fp16 for Jetson/TensorRT, int8 for CPU.')
+                        help='Model precision. int8 will fall back to fp16 in PyTorch mode.')
     parser.add_argument('--prune', type=float, default=0.0, help='Pruning ratio (0-1)')
     parser.add_argument('--no-mirror', action='store_true', help='Disable horizontal flip')
     args = parser.parse_args()

@@ -23,30 +23,18 @@ from hand_tracking import HandTrackingPipeline  # type: ignore
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export/prune/quantize hand models from custom weights.")
-    parser.add_argument('--detector-weights', required=True, help='Path to detector .pth (blazepalm).')
-    parser.add_argument('--landmark-weights', required=True, help='Path to landmark .pth (blazehand_landmark).')
+    parser = argparse.ArgumentParser(description="Export/prune/quantize hand models from custom weights (deprecated).")
+    parser.add_argument('--detector-weights', help='(Deprecated) Path to detector .pth (blazepalm).')
+    parser.add_argument('--landmark-weights', help='(Deprecated) Path to landmark .pth (blazehand_landmark).')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'int8'], default='fp32',
-                        help='Export precision (fp16/ int8).')
-    parser.add_argument('--prune', type=float, default=0.0, help='Prune ratio (0-1).')
+                        help='Export precision (ignored in PyTorch-only runtime).')
+    parser.add_argument('--prune', type=float, default=0.0, help='Prune ratio (ignored).')
     parser.add_argument('--prune-mode', choices=['magnitude', 'channel_l1'], default='magnitude',
-                        help='Pruning mode: unstructured magnitude or L1 channel pruning.')
-    parser.add_argument('--tag', type=str, default=None, help='Append tag to ONNX filenames.')
-    args = parser.parse_args()
+                        help='Pruning mode (ignored).')
+    parser.add_argument('--tag', type=str, default=None, help='Append tag to ONNX filenames (ignored).')
+    parser.parse_args()
 
-    pipeline = HandTrackingPipeline(
-        detector_weights=args.detector_weights,
-        landmark_weights=args.landmark_weights,
-        precision=args.precision,
-        prune_ratio=args.prune,
-        prune_mode=args.prune_mode,
-        model_tag=args.tag,
-        build_only=True,  # just export/cache
-    )
-
-    print("Export complete.")
-    print(f"Detector ONNX: assets/models/{pipeline._get_detector_name()}")
-    print(f"Landmark ONNX: assets/models/{pipeline._get_landmark_name()}")
+    raise SystemExit("Export path removed: runtime now loads cached ONNX via onnx2pytorch (no new exports).")
 
 
 if __name__ == "__main__":
