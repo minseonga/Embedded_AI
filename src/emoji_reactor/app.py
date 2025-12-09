@@ -16,6 +16,7 @@ Run examples:
 Voice hotwords (if Vosk + model installed): say “emoji” or “monkey” to switch sets.
 """
 
+import torch
 import argparse
 import os
 import sys
@@ -352,7 +353,6 @@ class HFKeywordListener(threading.Thread):
             self._ready.set()
             return
         try:
-            import torch
             import transformers
             from transformers import WhisperForConditionalGeneration, WhisperProcessor, WhisperConfig
             print(f"[VOICE] HF import ok: torch {torch.__version__}, transformers {transformers.__version__}")
@@ -563,7 +563,20 @@ def main():
         music = BackgroundMusic(str(music_path), enabled=True)
         music.start()
 
-    cap = cv2.VideoCapture(args.camera)
+    WIDTH = 960
+    HEIGHT = 720
+    GSTREAMER_PIPELINE = (
+        "nvarguscamerasrc sensor-id=0 ! "
+        "nvvidconv ! "
+        "video/x-raw, format=BGRx ! "
+        "videoconvert ! "
+        "video/x-raw, format=BGR ! "
+        "appsink drop=1"
+    )
+    
+    print(f"Opening camera with GStreamer pipeline...")
+    # 수정: 파이프라인 변수와 백엔드 명시
+    cap = cv2.VideoCapture(GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
         print("Cannot open camera")
         return
