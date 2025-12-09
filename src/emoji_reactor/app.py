@@ -47,8 +47,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from hand_tracking import HandTrackingPipeline, draw_landmarks, draw_detections  # noqa: E402
 
-WINDOW_WIDTH = 960
-WINDOW_HEIGHT = 720
+WINDOW_WIDTH = 640
+WINDOW_HEIGHT = 480
 EMOJI_SIZE = (WINDOW_WIDTH, WINDOW_HEIGHT)
 
 SMILE_LANDMARKS = {
@@ -563,10 +563,9 @@ def main():
         music = BackgroundMusic(str(music_path), enabled=True)
         music.start()
 
-    WIDTH = 960
-    HEIGHT = 720
     GSTREAMER_PIPELINE = (
         "nvarguscamerasrc sensor-id=0 ! "
+        "video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! "
         "nvvidconv ! "
         "video/x-raw, format=BGRx ! "
         "videoconvert ! "
@@ -581,11 +580,7 @@ def main():
         print("Cannot open camera")
         return
 
-    cv2.namedWindow('Camera Feed', cv2.WINDOW_NORMAL)
-    cv2.namedWindow('Emoji Output', cv2.WINDOW_NORMAL)
     cv2.namedWindow('Reactor View', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Camera Feed', WINDOW_WIDTH, WINDOW_HEIGHT)
-    cv2.resizeWindow('Emoji Output', WINDOW_WIDTH, WINDOW_HEIGHT)
     cv2.resizeWindow('Reactor View', WINDOW_WIDTH * 2, WINDOW_HEIGHT)
 
     fps_hist = []
@@ -627,6 +622,9 @@ def main():
             voice_status = f"Voice[{voice_backend}]: not configured"
 
     active_mode = "default"
+    frame_count = 0
+    cached_mar = 0.0
+    cached_mouth_center = None
 
     while True:
         ret, frame = cap.read()
@@ -649,18 +647,23 @@ def main():
             fps_hist.pop(0)
         avg_fps = float(np.mean(fps_hist))
 
-        # Face mesh for smile
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        face_res = face_mesh.process(rgb)
-        mar = 0.0
-        mouth_center = None
-        if face_res.multi_face_landmarks:
-            mar = mouth_aspect_ratio(face_res.multi_face_landmarks[0])
-            ul = face_res.multi_face_landmarks[0].landmark[SMILE_LANDMARKS["upper_lip"]]
-            ll = face_res.multi_face_landmarks[0].landmark[SMILE_LANDMARKS["lower_lip"]]
-            mouth_center = np.array([(ul.x + ll.x) * 0.5 * w, (ul.y + ll.y) * 0.5 * h])
-            if not args.no_face:
-                draw_face_landmarks(frame, face_res.multi_face_landmarks[0])
+        # Face mesh for smile (run every 5 frames for performance)
+        frame_count += 1
+        if frame_count % 5 == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            face_res = face_mesh.process(rgb)
+            if face_res.multi_face_landmarks:
+                cached_mar = mouth_aspect_ratio(face_res.multi_face_landmarks[0])
+                ul = face_res.multi_face_landmarks[0].landmark[SMILE_LANDMARKS["upper_lip"]]
+                ll = face_res.multi_face_landmarks[0].landmark[SMILE_LANDMARKS["lower_lip"]]
+                cached_mouth_center = np.array([(ul.x + ll.x) * 0.5 * w, (ul.y + ll.y) * 0.5 * h])
+                if not args.no_face:
+                    draw_face_landmarks(frame, face_res.multi_face_landmarks[0])
+            else:
+                cached_mar = 0.0
+                cached_mouth_center = None
+        mar = cached_mar
+        mouth_center = cached_mouth_center
 
         # State decision (mode-specific)
         if active_mode == "monkey":
@@ -739,8 +742,6 @@ def main():
         cv2.putText(vis, 'Press "q" or ESC to quit', (10, h - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
-        cv2.imshow('Camera Feed', vis)
-        cv2.imshow('Emoji Output', emoji)
         combined = np.hstack((vis, emoji))
         cv2.imshow('Reactor View', combined)
 
