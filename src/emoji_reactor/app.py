@@ -538,6 +538,8 @@ def main():
     parser.add_argument('--input-device', type=str, default=None,
                         help='sounddevice input device name or index for mic (e.g., 0 or "MacBook Pro Microphone").')
     parser.add_argument('--no-gstreamer', action='store_true', help='Disable GStreamer (use standard V4L2).')
+    parser.add_argument('--use-dnn', action='store_true',
+                        help='Use DNN face detector instead of Haar Cascade (more accurate, slightly slower).')
     args = parser.parse_args()
 
     emoji_sets = load_emojis()
@@ -575,8 +577,8 @@ def main():
     cv2.resizeWindow('Reactor View', WINDOW_WIDTH * 2, WINDOW_HEIGHT)
 
     fps_hist = []
-    # GPU-accelerated face landmark (replaces MediaPipe Face Mesh)
-    face_pipeline = FaceLandmarkPipeline(precision=args.precision)
+    # Lightweight face detection (Haar Cascade or DNN)
+    face_pipeline = FaceLandmarkPipeline(precision=args.precision, use_dnn=args.use_dnn)
     face_pipeline.print_stats()
 
     # Optional voice hotword listener

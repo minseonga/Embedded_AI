@@ -1,6 +1,6 @@
 # face_landmark/pipeline.py
-# Ultra-lightweight face detector using OpenCV YuNet + MAR estimation.
-# Optimized for Jetson Nano with quantization support.
+# Ultra-lightweight face detector using Haar Cascades (apt-get opencv compatible).
+# Optimized for Jetson Nano - works with old OpenCV versions.
 
 import os
 import urllib.request
@@ -14,100 +14,154 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "assets" / "models"
 
-# YuNet model URL (ultra-lightweight ~1MB)
-YUNET_MODEL_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+# DNN model URLs (fallback option)
+CAFFE_PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+CAFFE_MODEL_URL = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
 
-def download_yunet_model():
-    """Download YuNet face detection model."""
-    model_path = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
-    if model_path.exists():
-        return str(model_path)
+def download_dnn_model():
+    """Download OpenCV DNN face detection model (Caffe)."""
+    prototxt_path = MODEL_DIR / "deploy.prototxt"
+    model_path = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
+
+    if prototxt_path.exists() and model_path.exists():
+        return str(prototxt_path), str(model_path)
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print("[FaceLandmark] Downloading YuNet model...")
+
     try:
-        urllib.request.urlretrieve(YUNET_MODEL_URL, str(model_path))
-        print(f"[FaceLandmark] Downloaded to {model_path}")
-        return str(model_path)
+        if not prototxt_path.exists():
+            print("[FaceLandmark] Downloading deploy.prototxt...")
+            urllib.request.urlretrieve(CAFFE_PROTOTXT_URL, str(prototxt_path))
+
+        if not model_path.exists():
+            print("[FaceLandmark] Downloading Caffe model (~10MB)...")
+            urllib.request.urlretrieve(CAFFE_MODEL_URL, str(model_path))
+
+        print(f"[FaceLandmark] DNN models downloaded")
+        return str(prototxt_path), str(model_path)
     except Exception as e:
-        print(f"[FaceLandmark] Download failed: {e}")
-        return None
+        print(f"[FaceLandmark] DNN model download failed: {e}")
+        return None, None
 
 
-class YuNetFaceDetector:
-    """Ultra-lightweight face detector using OpenCV YuNet (~250KB).
+class HaarCascadeFaceDetector:
+    """Ultra-fast face detector using Haar Cascades.
 
-    YuNet is optimized for edge devices and supports:
-    - OpenCV DNN backend with CUDA acceleration
-    - Very fast inference (~5-10ms on Jetson Nano)
-    - Small model size (~1MB)
+    Advantages:
+    - Works with ALL OpenCV versions (even old apt-get versions)
+    - Extremely fast (~1-2ms per frame on Jetson Nano)
+    - Very lightweight (~1MB)
+    - No download needed (built into OpenCV)
     """
 
     def __init__(self, device: torch.device, precision: str = "fp16"):
         self.device = device
         self.precision = precision
-        self.score_threshold = 0.6
-        self.nms_threshold = 0.3
-        self.top_k = 5000
+        self.scale_factor = 1.1
+        self.min_neighbors = 5
+        self.min_size = (30, 30)
 
-        # Download model
-        model_path = download_yunet_model()
-        if model_path is None:
-            print("[FaceLandmark] YuNet model not available")
-            self.detector = None
-            return
+        # Load Haar Cascade (built into OpenCV)
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        self.detector = cv2.CascadeClassifier(cascade_path)
 
-        # Initialize YuNet detector
-        self.detector = cv2.FaceDetectorYN.create(
-            model_path,
-            "",
-            (320, 320),
-            self.score_threshold,
-            self.nms_threshold,
-            self.top_k
+        if self.detector.empty():
+            raise RuntimeError("Failed to load Haar Cascade")
+
+        print(f"[FaceLandmark] Haar Cascade detector loaded (ultra-fast, built-in)")
+
+    def detect(self, frame: np.ndarray) -> np.ndarray:
+        """Return array of [x, y, w, h, score]."""
+        # Convert to grayscale for faster processing
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Detect faces
+        faces = self.detector.detectMultiScale(
+            gray,
+            scaleFactor=self.scale_factor,
+            minNeighbors=self.min_neighbors,
+            minSize=self.min_size,
+            flags=cv2.CASCADE_SCALE_IMAGE
         )
 
-        # Set CUDA backend if available on Jetson Nano
+        if len(faces) == 0:
+            return np.array([])
+
+        # Convert to [x, y, w, h, score] format
+        # Haar doesn't provide confidence, so we use 1.0
+        results = []
+        for (x, y, w, h) in faces:
+            results.append([int(x), int(y), int(w), int(h), 1.0])
+
+        return np.array(results) if results else np.array([])
+
+
+class DNNFaceDetector:
+    """DNN-based face detector using OpenCV DNN + Caffe.
+
+    Advantages:
+    - Works with OpenCV 3.3+ (most apt-get versions)
+    - More accurate than Haar Cascades
+    - CUDA acceleration support
+    - Still lightweight (~10MB)
+    """
+
+    def __init__(self, device: torch.device, precision: str = "fp16"):
+        self.device = device
+        self.precision = precision
+        self.confidence_threshold = 0.5
+
+        # Download models
+        prototxt_path, model_path = download_dnn_model()
+        if prototxt_path is None or model_path is None:
+            raise RuntimeError("Failed to download DNN models")
+
+        # Load DNN model
+        self.detector = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
+
+        # Set CUDA backend if available
         if device.type == 'cuda':
             try:
                 self.detector.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                 self.detector.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                print("[FaceLandmark] YuNet using CUDA backend")
+                print("[FaceLandmark] DNN using CUDA backend")
             except Exception:
-                print("[FaceLandmark] YuNet using CPU backend")
+                print("[FaceLandmark] DNN using CPU backend")
+        else:
+            print("[FaceLandmark] DNN using CPU backend")
 
-        print(f"[FaceLandmark] YuNet detector loaded (~1MB, ultra-fast)")
+        print(f"[FaceLandmark] DNN detector loaded (~10MB, CUDA accelerated)")
 
     def detect(self, frame: np.ndarray) -> np.ndarray:
         """Return array of [x, y, w, h, score]."""
-        if self.detector is None:
-            return np.array([])
-
         h, w = frame.shape[:2]
 
-        # Set input size dynamically
-        self.detector.setInputSize((w, h))
+        # Prepare blob
+        blob = cv2.dnn.blobFromImage(
+            frame, 1.0, (300, 300), (104.0, 177.0, 123.0), False, False
+        )
 
-        try:
-            # Detect faces
-            _, faces = self.detector.detect(frame)
+        # Forward pass
+        self.detector.setInput(blob)
+        detections = self.detector.forward()
 
-            if faces is None or len(faces) == 0:
-                return np.array([])
+        # Parse detections
+        results = []
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
 
-            # Convert to [x, y, w, h, score] format
-            results = []
-            for face in faces:
-                x, y, w, h = face[:4].astype(int)
-                score = float(face[-1])
-                results.append([x, y, w, h, score])
+            if confidence > self.confidence_threshold:
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (x1, y1, x2, y2) = box.astype(int)
 
-            return np.array(results) if results else np.array([])
+                x, y = max(0, x1), max(0, y1)
+                w_box = min(w - x, x2 - x1)
+                h_box = min(h - y, y2 - y1)
 
-        except Exception as e:
-            print(f"[FaceLandmark] Detection error: {e}")
-            return np.array([])
+                results.append([int(x), int(y), int(w_box), int(h_box), float(confidence)])
+
+        return np.array(results) if results else np.array([])
 
 
 class RatioBasedMAR:
@@ -147,12 +201,17 @@ class RatioBasedMAR:
 
 
 class FaceLandmarkPipeline:
-    """PyTorch face detection pipeline for Jetson Nano + MAR estimation."""
+    """Face detection pipeline for Jetson Nano + MAR estimation.
+
+    Uses Haar Cascades by default (works with all OpenCV versions).
+    Falls back to DNN if Haar fails.
+    """
 
     def __init__(
         self,
         precision: str = "fp16",
         use_cuda: bool = True,
+        use_dnn: bool = False,  # Set to True to prefer DNN over Haar
     ):
         self.precision = precision
         self.device = torch.device('cuda' if use_cuda and torch.cuda.is_available() else 'cpu')
@@ -161,12 +220,40 @@ class FaceLandmarkPipeline:
         print(f"[FaceLandmark] Device: {self.device}")
 
         self.detector = None
-        try:
-            self.detector = YuNetFaceDetector(self.device, precision=self.precision)
-            print("[FaceLandmark] YuNet face detector loaded (OpenCV DNN + CUDA)")
-        except Exception as e:
-            print(f"[FaceLandmark] Face detector failed: {e}")
-            self.detector = None
+        detector_type = "unknown"
+
+        # Try to load face detector
+        if use_dnn:
+            # Try DNN first if requested
+            try:
+                self.detector = DNNFaceDetector(self.device, precision=self.precision)
+                detector_type = "DNN (OpenCV Caffe)"
+            except Exception as e:
+                print(f"[FaceLandmark] DNN detector failed: {e}, falling back to Haar Cascade")
+                try:
+                    self.detector = HaarCascadeFaceDetector(self.device, precision=self.precision)
+                    detector_type = "Haar Cascade (built-in)"
+                except Exception as e2:
+                    print(f"[FaceLandmark] Haar Cascade failed: {e2}")
+                    self.detector = None
+        else:
+            # Try Haar Cascade first (default, works with all OpenCV)
+            try:
+                self.detector = HaarCascadeFaceDetector(self.device, precision=self.precision)
+                detector_type = "Haar Cascade (built-in)"
+            except Exception as e:
+                print(f"[FaceLandmark] Haar Cascade failed: {e}, falling back to DNN")
+                try:
+                    self.detector = DNNFaceDetector(self.device, precision=self.precision)
+                    detector_type = "DNN (OpenCV Caffe)"
+                except Exception as e2:
+                    print(f"[FaceLandmark] DNN detector failed: {e2}")
+                    self.detector = None
+
+        if self.detector:
+            print(f"[FaceLandmark] Using {detector_type}")
+        else:
+            print("[FaceLandmark] WARNING: No face detector available!")
 
         self.mar_estimator = RatioBasedMAR()
 
@@ -200,10 +287,20 @@ class FaceLandmarkPipeline:
     def print_stats(self):
         print(f"[FaceLandmark] Device: {self.device}")
         print(f"[FaceLandmark] Precision: {self.precision}")
-        det_type = "YuNet (OpenCV DNN + CUDA, ~1MB)" if self.detector else "None"
+
+        if self.detector:
+            if isinstance(self.detector, HaarCascadeFaceDetector):
+                det_type = "Haar Cascade (built-in, ultra-fast)"
+            elif isinstance(self.detector, DNNFaceDetector):
+                det_type = "DNN Caffe (~10MB, CUDA accelerated)"
+            else:
+                det_type = "Unknown"
+        else:
+            det_type = "None"
+
         print(f"[FaceLandmark] Detector: {det_type}")
         print(f"[FaceLandmark] MAR: Ratio-based estimation")
-        print(f"[FaceLandmark] Optimized for Jetson Nano")
+        print(f"[FaceLandmark] Compatible with apt-get OpenCV")
 
 
 def draw_face_box(frame: np.ndarray, face_box: np.ndarray, color=(255, 0, 0)):
