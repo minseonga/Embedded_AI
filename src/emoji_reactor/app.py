@@ -27,7 +27,6 @@ import subprocess
 from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import queue
 import sounddevice as sd
@@ -46,17 +45,11 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from hand_tracking import HandTrackingPipeline, draw_landmarks, draw_detections  # noqa: E402
+from face_landmark import FaceLandmarkPipeline  # noqa: E402
 
 WINDOW_WIDTH = 640
 WINDOW_HEIGHT = 480
 EMOJI_SIZE = (WINDOW_WIDTH, WINDOW_HEIGHT)
-
-SMILE_LANDMARKS = {
-    "left_corner": 291,
-    "right_corner": 61,
-    "upper_lip": 13,
-    "lower_lip": 14,
-}
 
 
 def load_emoji_set(prefix, names):
@@ -114,19 +107,6 @@ def patch_tensorflow_stub():
             print("[VOICE] Patched missing tensorflow.Tensor")
     except Exception:
         pass
-
-
-def mouth_aspect_ratio(face_landmarks):
-    lc = face_landmarks.landmark[SMILE_LANDMARKS["left_corner"]]
-    rc = face_landmarks.landmark[SMILE_LANDMARKS["right_corner"]]
-    ul = face_landmarks.landmark[SMILE_LANDMARKS["upper_lip"]]
-    ll = face_landmarks.landmark[SMILE_LANDMARKS["lower_lip"]]
-
-    mouth_w = ((rc.x - lc.x) ** 2 + (rc.y - lc.y) ** 2) ** 0.5
-    mouth_h = ((ll.x - ul.x) ** 2 + (ll.y - ul.y) ** 2) ** 0.5
-    if mouth_w <= 0:
-        return 0.0
-    return mouth_h / mouth_w
 
 
 def is_hand_up(det, scale, pad, frame_h, raise_thresh):
@@ -380,6 +360,13 @@ class HFKeywordListener(threading.Thread):
                 print(f"[VOICE] Loading local weights from {model_id} with base {self.base_repo}")
                 state = load_file(model_id, device="cpu")
                 config = WhisperConfig.from_pretrained(self.base_repo)
+                # Fix vocab size mismatch (e.g., 51864 vs 51865)
+                embed_key = "model.decoder.embed_tokens.weight"
+                if embed_key in state:
+                    saved_vocab_size = state[embed_key].shape[0]
+                    if saved_vocab_size != config.vocab_size:
+                        print(f"[VOICE] Adjusting vocab_size: {config.vocab_size} -> {saved_vocab_size}")
+                        config.vocab_size = saved_vocab_size
                 model = WhisperForConditionalGeneration(config)
                 missing, unexpected = model.load_state_dict(state, strict=False)
                 if missing or unexpected:
@@ -584,7 +571,9 @@ def main():
     cv2.resizeWindow('Reactor View', WINDOW_WIDTH * 2, WINDOW_HEIGHT)
 
     fps_hist = []
-    face_mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5)
+    # GPU-accelerated face landmark (replaces MediaPipe Face Mesh)
+    face_pipeline = FaceLandmarkPipeline(precision=args.precision)
+    face_pipeline.print_stats()
 
     # Optional voice hotword listener
     listener = None
@@ -647,18 +636,12 @@ def main():
             fps_hist.pop(0)
         avg_fps = float(np.mean(fps_hist))
 
-        # Face mesh for smile (run every 5 frames for performance)
+        # Face landmark for smile (GPU-accelerated, run every 5 frames)
         frame_count += 1
         if frame_count % 5 == 0:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            face_res = face_mesh.process(rgb)
-            if face_res.multi_face_landmarks:
-                cached_mar = mouth_aspect_ratio(face_res.multi_face_landmarks[0])
-                ul = face_res.multi_face_landmarks[0].landmark[SMILE_LANDMARKS["upper_lip"]]
-                ll = face_res.multi_face_landmarks[0].landmark[SMILE_LANDMARKS["lower_lip"]]
-                cached_mouth_center = np.array([(ul.x + ll.x) * 0.5 * w, (ul.y + ll.y) * 0.5 * h])
-                if not args.no_face:
-                    draw_face_landmarks(frame, face_res.multi_face_landmarks[0])
+            face_landmarks, cached_mar, face_box = face_pipeline.process_frame(frame)
+            if face_landmarks is not None:
+                cached_mouth_center = face_pipeline.get_mouth_center(face_landmarks)
             else:
                 cached_mar = 0.0
                 cached_mouth_center = None
@@ -757,7 +740,6 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    face_mesh.close()
     if listener:
         listener.stop()
     if music:
