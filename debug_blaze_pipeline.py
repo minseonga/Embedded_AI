@@ -18,7 +18,8 @@ class DebugPipeline(BlazeHandTrackingPipeline):
         cv2.imwrite("debug_input_256.jpg", cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))
         print(f"[DEBUG] Saved debug_input_256.jpg (Shape: {img1.shape})")
         
-        img1_tensor = torch.from_numpy(img1).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
+        # Note: predict_on_batch handles normalization internally
+        img1_tensor = torch.from_numpy(img1).permute(2, 0, 1).unsqueeze(0).float()
         img1_tensor = img1_tensor.to(self.device)
         
         if self.precision == 'fp16' and self.device.type == 'cuda':
