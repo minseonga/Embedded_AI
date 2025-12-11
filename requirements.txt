@@ -1,0 +1,8 @@
+# Core
+opencv-python
+numpy
+
+# ONNX Runtime for inference
+onnxruntime  # For CPU
+# onnxruntime-gpu  # For GPU (if CUDA available)
+torch_pruning
